@@ -1,0 +1,13 @@
+__pycache__/
+*.so
+*.egg-info/
+build/
+build_ngp/
+build_gtsam/
+third_party/**/build/
+envs/*/            # never commit conda envs
+datasets/
+data/
+*.ckpt
+*.pth
+.idea/
