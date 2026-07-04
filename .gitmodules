@@ -1,0 +1,6 @@
+[submodule "third_party/nerf-slam"]
+	path = third_party/nerf-slam
+	url = git@github.com:ArthurFriedri-ch/NeRF-SLAM.git
+[submodule "third_party/triangle-splatting2"]
+	path = third_party/triangle-splatting2
+	url = git@github.com:ArthurFriedri-ch/triangle-splatting2.git
