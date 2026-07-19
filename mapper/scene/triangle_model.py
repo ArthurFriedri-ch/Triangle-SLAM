@@ -219,7 +219,7 @@ class TriangleModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-
+    # TODO: This is the old delaunay instantiation. Remove
     def create_from_pcd(self, pcd : BasicPointCloud, opacity : float, set_sigma : float):
 
         # we remove all points that are too close to each other. Otherwise, this somehow gives an oom
@@ -274,7 +274,40 @@ class TriangleModel:
 
         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
-        
+
+    def populate_triangle_model(self, vertices, faces, colors, sigma=0.5, opacity=0.99):
+        """
+        vertices: (V,3) float tensor, world xyz
+        faces:    (T,3) int tensor, index triplets into vertices
+        colors:   (V,3) float tensor in [0,1]
+        """
+        device = "cuda"
+        V = vertices.shape[0]
+
+        _points = vertices.float().to(device)
+
+        # --- features: RGB -> SH, DC term only (degree 0), rest zeroed ---
+        fused_color = RGB2SH(colors.float().to(device))  # (V,3)
+        features = torch.zeros((V, 3, (self.max_sh_degree + 1) ** 2), device=device)
+        features[:, :3, 0] = fused_color
+
+        self.vertices = nn.Parameter(_points.requires_grad_(True))
+        self._triangle_indices = faces.to(torch.int32).to(device)  # (T,3) int32
+
+        # vertex_weight is stored in logit space; get_vertex_weight applies opacity_activation
+        vert_weight = inverse_sigmoid(
+            opacity * torch.ones((V, 1), dtype=torch.float, device=device))
+        self.vertex_weight = nn.Parameter(vert_weight.requires_grad_(True))
+
+        # sigma stored as log(sigma); get_sigma applies exp
+        self.set_sigma(sigma)
+
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+
+        self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device=device)
+        self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device=device)
+        return self
 
     def training_setup(self, training_args, lr_mask, lr_features, weight_lr, lr_sigma, lr_triangles_init):
 
