@@ -23,11 +23,8 @@ _BG = torch.tensor([0., 0., 0.], device="cuda")  # black background
 
 background = torch.tensor([0., 0., 0.], device="cuda")  # black bg
 
-STRIDE = 8  # grid coarseness (pixels); coarse on purpose
-COV_MAX = 1.0  # skip vertices with covariance above this (gauge units!)
-EDGE_MAX = 0.10  # relative depth jump above which a quad is a discontinuity
 ALPHA_SEEN = 0.5  # novelty: below this accumulated alpha => unseen => seed
-FIXED_SIGMA = 0.01  # static sigma for all triangles; no annealing today
+FIXED_SIGMA = 0.001  # static sigma for all triangles; no annealing today
 
 
 class Keyframe:
@@ -64,6 +61,8 @@ class TriangleMapper:
             off += len(p.vertices)
             colors.append(p.age_colors if colors_mode == "age" else p.colors)
         tm.populate_triangle_model(torch.cat(verts), torch.cat(faces), torch.cat(colors), FIXED_SIGMA)
+        with torch.no_grad():
+            tm.vertex_weight.fill_(20.0)
         return tm
 
     def _render(self, kf, colors_mode="rgb"):
@@ -79,18 +78,9 @@ class TriangleMapper:
 
     def integrate(self, record):
         kf = Keyframe(record, self.device)
-        if self.is_empty():
-            mask = kf.depth > 0
-        else:
-            alpha = self.render_coverage(kf)
-            mask = (kf.depth > 0) & (alpha < ALPHA_SEEN)
-        # Always include a 10-pixel border
-        border = 32
-        mask[:border, :] = True  # top
-        mask[-border:, :] = True  # bottom
-        mask[:, :border] = True  # left
-        mask[:, -border:] = True  # right
-        patch = seed_patch(kf, mask)
+        patch, image = seed_patch(kf)
+        save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"))
+
         patch.age = record.index
         color = age_to_color(record.index, device=self.device)  # (3,)
         patch.age_colors = color.unsqueeze(0).expand(patch.vertices.shape[0], 3).contiguous()  # (V,3)
@@ -98,7 +88,7 @@ class TriangleMapper:
 
         # self.optimize() ; self.anneal() ; self.densify()
 
-        self.dump_views(kf, mask, self.out_dir)
+        self.dump_views(kf, self.out_dir, image)
         print(f"kf {record.index}: {len(patch.faces)} tris, {len(self.patches)} patches")
 
     def render_age_view(self, kf, path):
@@ -106,20 +96,26 @@ class TriangleMapper:
         pkg = self._render(kf, colors_mode="age")
         torchvision.utils.save_image(pkg["render"], path)
 
-    def dump_views(self, kf, mask, out_dir):
+    def dump_views(self, kf, out_dir, patch_debug=None):
         os.makedirs(out_dir, exist_ok=True)
         idx = kf.index
 
         pkg_rgb = self._render(kf, colors_mode="rgb")
         pkg_age = self._render(kf, colors_mode="age")
-        alpha = pkg_rgb["rend_alpha"].clamp(0, 1)  # (1,H,W)
-        gt = kf.rgb.permute(2, 0, 1)  # (3,H,W), 0..1
-        mask = mask.float().unsqueeze(0).expand(3, -1, -1)  # (3,H,W)
+        alpha = pkg_rgb["rend_alpha"].clamp(0, 1)          # (1,H,W)
+        gt = kf.rgb.permute(2, 0, 1)                       # (3,H,W)
 
-        panel = torch.cat([gt, pkg_rgb["render"].clamp(0, 1),
-                           pkg_age["render"].clamp(0, 1), mask,
-                           alpha.repeat(3, 1, 1)], dim=2)  # concat along width
-        torchvision.utils.save_image(panel, os.path.join(out_dir, f"kf{idx:04d}_panel.png"))
+        tiles = [gt, pkg_rgb["render"].clamp(0, 1),
+                 pkg_age["render"].clamp(0, 1),
+                 alpha.repeat(3, 1, 1)]
+
+        if patch_debug is not None:
+            # patch_debug = debug_render_pslg(valid, vertices, segments, holes, points)
+            tiles.append(patch_debug.to(gt.device))
+
+        panel = torch.cat(tiles, dim=2)                    # concat along width
+        torchvision.utils.save_image(
+            panel, os.path.join(out_dir, f"kf{idx:04d}_panel.png"))
 
 
 def source_from_dir(d):
@@ -143,11 +139,31 @@ def make_view(kf, W, H):
     R = w2c[:3, :3].T  # Camera expects R transposed (3DGS convention) — verify in cameras.py
     T = w2c[:3, 3]
     fx, fy = kf.K[0, 0].item(), kf.K[1, 1].item()
-    FoVx = 2 * math.atan(W / (2 * fx));
+    FoVx = 2 * math.atan(W / (2 * fx))
     FoVy = 2 * math.atan(H / (2 * fy))
     return Camera(colmap_id=0, R=R, T=T, FoVx=FoVx, FoVy=FoVy,
                   image=torch.zeros(3, H, W),  # dummy; render doesn't need real pixels
                   gt_alpha_mask=None, image_name=f"kf{kf.index}", uid=kf.index)
+
+
+def save_patch_npz(patch, path):
+    """Write a single patch to a self-contained .npz for the polyscope viewer."""
+    def np_(x):
+        return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+    data = {
+        "vertices": np_(patch.vertices).astype(np.float64),
+        "faces":    np_(patch.faces).astype(np.int64),
+    }
+    if hasattr(patch, "colors"):
+        data["colors"] = np.clip(np_(patch.colors), 0, 1).astype(np.float64)
+    if hasattr(patch, "age_colors"):
+        data["age_colors"] = np.clip(np_(patch.age_colors), 0, 1).astype(np.float64)
+    if hasattr(patch, "age"):
+        data["age"] = np.asarray(getattr(patch, "age"))
+
+    np.savez_compressed(path, **data)
+    print(f"[save_patch_npz] wrote {path}")
 
 
 if __name__ == "__main__":
