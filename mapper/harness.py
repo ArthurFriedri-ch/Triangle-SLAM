@@ -66,7 +66,7 @@ class TriangleMapper:
         return tm
 
     def _render(self, kf, colors_mode="rgb"):
-        tm = self._build_model(colors_mode)
+        tm = self._build_model(colors_mode=colors_mode)
         view = make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0])  # W, H
         return render(view, tm, _pipe, _BG)
 
@@ -78,7 +78,11 @@ class TriangleMapper:
 
     def integrate(self, record):
         kf = Keyframe(record, self.device)
-        patch, image = seed_patch(kf)
+        if self.patches:
+            tm = self._build_model(colors_mode="rgb")
+        else:
+            tm = None
+        patch, image, ids = seed_patch(kf, tm)
         save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"))
 
         patch.age = record.index
