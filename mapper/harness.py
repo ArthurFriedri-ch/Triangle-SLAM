@@ -59,6 +59,8 @@ FIXED_SIGMA = 0.001
 # Initial per-vertex opacity in (0,1). Stored as a logit internally; the old
 # hard-coded vertex_weight of 20.0 was that logit, i.e. opacity ~1.0.
 INIT_OPACITY = 0.99
+# Softness at the end of the anneal. TS+ trains down to this.
+SIGMA_FINAL = 0.0001
 AGE_MAX_PATCHES = 200
 
 
@@ -87,7 +89,7 @@ class TriangleMapper:
                  occlusion_rel=OCCLUSION_REL,
                  occlusion_min_area=OCCLUSION_MIN_AREA,
                  min_region_frac=MIN_REGION_FRAC,
-                 sigma=FIXED_SIGMA, sigma_final=None, sigma_until_s=0.0,
+                 sigma=FIXED_SIGMA, sigma_final=SIGMA_FINAL, sigma_anneal_s=10.0,
                  opacity=INIT_OPACITY, iters_per_second=0.0,
                  record_fps=30.0, opt_window=8, weight_sparsity=False,
                  age_max_patches=AGE_MAX_PATCHES):
@@ -101,7 +103,7 @@ class TriangleMapper:
         self.min_region_frac = min_region_frac
         self.sigma0 = sigma                 # initial softness
         self.sigma_final = sigma if sigma_final is None else sigma_final
-        self.sigma_until_s = sigma_until_s  # anneal span, record seconds
+        self.sigma_anneal_s = sigma_anneal_s   # tail seconds to anneal over
         self.opacity = opacity              # initial transparency
         self.iters_per_second = iters_per_second
         self.record_fps = record_fps
@@ -116,6 +118,7 @@ class TriangleMapper:
         self._video_n = 0
         self._t0 = None
         self._last_t = None
+        self._tail_t = None   # seconds into the tail; None while seeding
         self.gt_depth = gt_depth            # GtDepthSource or None
         self.verify_mesh = verify_mesh
         self._n_seen = 0
@@ -392,21 +395,33 @@ class TriangleMapper:
         is purely refinement, and it is what shows whether the optimiser is
         still improving the surface once the geometry has settled.
         """
-        if self._overview is None or seconds <= 0:
+        if seconds <= 0 or self._model is None:
             return
-        n_frames = int(round(seconds * self._video_fps))
+        n_frames = max(int(round(seconds * self._video_fps)), 1)
         per_frame = max(int(round(self.iters_per_second / self._video_fps)), 0)
-        if per_frame == 0:
-            print(f"[video] tail: {n_frames} frames, no optimisation "
-                  f"(--iters_per_second is 0)")
-        else:
-            print(f"[video] tail: {seconds}s, {n_frames} frames, "
-                  f"{per_frame} iterations each")
+        anneal = (f", sigma {self.sigma0:g} -> {self.sigma_final:g} over "
+                  f"{self.sigma_anneal_s:g}s" if self.sigma_anneal_s > 0 else "")
+        print(f"[tail] {seconds:g}s, {n_frames} frames, {per_frame} iterations "
+              f"each{anneal}")
+        if self.sigma_anneal_s > seconds:
+            print(f"[tail] WARNING: the anneal spans {self.sigma_anneal_s:g}s but "
+                  f"the tail is only {seconds:g}s, so sigma will stop at "
+                  f"{self._lerp_sigma(seconds / self.sigma_anneal_s):g} rather "
+                  f"than reaching {self.sigma_final:g}. Raise --tail_seconds.")
+
         last = self.mesh.patches[-1].kf_index if self.mesh.patches else 0
         for i in range(n_frames):
+            self._tail_t = i / max(self._video_fps, 1)   # drives _sigma_at
             if per_frame:
                 self.optimize(per_frame, last)
+            elif self._model is not None:
+                self._model.set_sigma(self._sigma_at(last))   # anneal anyway
             self.record_frame()
+        self._tail_t = seconds
+
+    def _lerp_sigma(self, a):
+        a = min(max(a, 0.0), 1.0)
+        return self.sigma0 + (self.sigma_final - self.sigma0) * a
 
 
     def _elapsed(self, kf_index):
@@ -439,11 +454,18 @@ class TriangleMapper:
         return float(np.mean(losses)) if losses else None
 
     def _sigma_at(self, kf_index):
-        """Anneal softness on record time, from --sigma down to --sigma_final."""
-        t = self._record_seconds(kf_index)
-        if self.sigma_until_s <= 0:
+        """Softness: held at --sigma while keyframes arrive, annealed after.
+
+        TS+ anneals sigma across its whole schedule, but that schedule has a
+        known length. Here the map is still growing while keyframes come in, and
+        every new patch wants the soft edges that let the optimiser move
+        geometry. So softness is held until the keyframes run out, then taken
+        down to --sigma_final over --sigma_anneal_seconds of the tail, which is
+        what sharpens the surface at the end.
+        """
+        if self._tail_t is None or self.sigma_anneal_s <= 0:
             return self.sigma0
-        a = min(max(t / self.sigma_until_s, 0.0), 1.0)
+        a = min(max(self._tail_t / self.sigma_anneal_s, 0.0), 1.0)
         return self.sigma0 + (self.sigma_final - self.sigma0) * a
 
     def _record_seconds(self, kf_index):
@@ -673,19 +695,22 @@ if __name__ == "__main__":
     p.add_argument("--video_height", type=int, default=1080)
     p.add_argument("--video_fps", type=int, default=30,
                    help="frame rate of the output video")
-    p.add_argument("--tail_seconds", type=float, default=5.0,
-                   help="keep optimising and recording for this long after the "
-                        "keyframes run out")
+    p.add_argument("--tail_seconds", type=float, default=10.0,
+                   help="keep optimising after the keyframes run out, recording "
+                        "if --video. This is also when sigma anneals, so it should\n"
+                        "be at least --sigma_anneal_seconds")
     p.add_argument("--video_out", default="keyframe_debug/map.mp4")
     p.add_argument("--sigma", type=float, default=FIXED_SIGMA,
                    help=f"initial softness for every triangle; default {FIXED_SIGMA} "
                         "(TS+ trains from 1.0)")
-    p.add_argument("--sigma_final", type=float, default=None,
-                   help="softness to anneal towards; default: no annealing")
-    p.add_argument("--sigma_until_seconds", type=float, default=0.0,
-                   help="record seconds over which sigma anneals from --sigma "
-                        "to --sigma_final. Named to distinguish it from TS+'s "
-                        "sigma_until, which counts iterations")
+    p.add_argument("--sigma_final", type=float, default=SIGMA_FINAL,
+                   help=f"softness at the end of the anneal; default {SIGMA_FINAL}")
+    p.add_argument("--sigma_anneal_seconds", type=float, default=10.0,
+                   help="seconds of the TAIL over which sigma goes from --sigma "
+                        "to --sigma_final. Softness is held while keyframes are "
+                        "still arriving, since new patches need soft edges for "
+                        "the optimiser to move them; 0 disables. Needs "
+                        "--tail_seconds at least this long to complete")
     p.add_argument("--opacity", type=float, default=INIT_OPACITY,
                    help=f"initial per-vertex opacity in (0,1); default {INIT_OPACITY}")
     p.add_argument("--iters_per_second", type=float, default=0.0,
@@ -762,7 +787,7 @@ if __name__ == "__main__":
                             occlusion_min_area=args.occlusion_min_area,
                             min_region_frac=args.min_region_frac,
                             sigma=args.sigma, sigma_final=args.sigma_final,
-                            sigma_until_s=args.sigma_until_seconds,
+                            sigma_anneal_s=args.sigma_anneal_seconds,
                             opacity=args.opacity,
                             iters_per_second=args.iters_per_second,
                             record_fps=args.record_fps,
@@ -785,8 +810,8 @@ if __name__ == "__main__":
                                size=(args.video_width, args.video_height))
         mapper.integrate(record)
 
+    mapper.run_tail(args.tail_seconds)
     if args.video:
-        mapper.run_tail(args.tail_seconds)
         encode_video(mapper._video_dir, args.video_out, args.video_fps)
 
     print(f"Done. {mapper.mesh.stats()}")
