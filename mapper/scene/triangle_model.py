@@ -90,6 +90,7 @@ class TriangleModel:
         point_cloud_state_dict["features_rest"] = self._features_rest
         point_cloud_state_dict["importance_score"] = self.importance_score
         point_cloud_state_dict["image_size"] = self.image_size
+        point_cloud_state_dict["face_patch"] = getattr(self, "face_patch", None)
 
         torch.save(point_cloud_state_dict, os.path.join(path, 'point_cloud_state_dict.pt'))
 
@@ -150,6 +151,13 @@ class TriangleModel:
 
         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
+        # older checkpoints predate patch ids, and `segment=True` above may have
+        # dropped triangles without subsetting them, so fall back on a mismatch
+        fp = state.get("face_patch", None)
+        n_tri = self._triangle_indices.shape[0]
+        if fp is None or len(fp) != n_tri:
+            fp = torch.zeros(n_tri, dtype=torch.int32)
+        self.face_patch = fp.to(torch.int32).to(device)
 
 
     def capture(self):
@@ -275,7 +283,8 @@ class TriangleModel:
         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
 
-    def populate_triangle_model(self, vertices, faces, colors, sigma=0.5, opacity=0.99):
+    def populate_triangle_model(self, vertices, faces, colors, sigma=0.5, opacity=0.99,
+                                patch_id=None):
         """
         vertices: (V,3) float tensor, world xyz
         faces:    (T,3) int tensor, index triplets into vertices
@@ -307,6 +316,10 @@ class TriangleModel:
 
         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device=device)
         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device=device)
+        # which patch each triangle came from, for per-patch scheduling
+        self.face_patch = (torch.zeros(self._triangle_indices.shape[0], dtype=torch.int32,
+                                       device=device) if patch_id is None
+                           else patch_id.to(torch.int32).to(device))
         return self
 
     def training_setup(self, training_args, lr_mask, lr_features, weight_lr, lr_sigma, lr_triangles_init):
@@ -346,6 +359,45 @@ class TriangleModel:
 
     def set_sigma(self, sigma):
         self._sigma = self.inverse_exponential_activation(sigma)
+
+    def set_trainable_vertices(self, mask):
+        """Restrict optimisation to `mask` (V,) bool, or None for everything.
+
+        Use with `GlobalMesh.vertex_mask(pid)` to schedule optimisation per
+        patch -- freeze what has settled, keep working on the frontier.
+        """
+        self._train_mask = mask
+
+    def step_optimizer(self):
+        """Adam step honouring `set_trainable_vertices`.
+
+        Zeroing a frozen row's gradient is NOT freezing it: Adam's exp_avg still
+        carries momentum from earlier steps, so the row keeps drifting for
+        ~1/(1-beta1) steps, and the shrinking exp_avg_sq amplifies what is left.
+        Exact freezing needs the values restored and the moments cleared, which
+        is what this does. The four parameter groups hold one whole tensor each
+        and the helpers assert that, so per-patch *param groups* are not an
+        option -- this is.
+        """
+        mask = getattr(self, "_train_mask", None)
+        if mask is None:
+            return self.optimizer.step()
+        frozen = ~mask
+        if not bool(frozen.any()):
+            return self.optimizer.step()
+
+        params = [p for p in (self.vertices, self.vertex_weight,
+                              self._features_dc, self._features_rest)
+                  if p is not None and p.numel()]
+        snap = [p.detach()[frozen].clone() for p in params]
+        self.optimizer.step()
+        with torch.no_grad():
+            for p, old in zip(params, snap):
+                p[frozen] = old
+                st = self.optimizer.state.get(p, {})
+                if "exp_avg" in st:
+                    st["exp_avg"][frozen] = 0
+                    st["exp_avg_sq"][frozen] = 0
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -400,7 +452,8 @@ class TriangleModel:
         return optimizable_tensors
     
 
-    def densification_postfix(self, new_vertices, new_vertex_weight, new_features_dc, new_features_rest, new_triangles):
+    def densification_postfix(self, new_vertices, new_vertex_weight, new_features_dc, new_features_rest, new_triangles,
+                              new_face_patch=None):
         # Create dictionary of new tensors to append
         d = {
             "vertices": new_vertices,
@@ -420,9 +473,21 @@ class TriangleModel:
         
         # Update triangle indices
         self._triangle_indices = torch.cat([
-            self._triangle_indices, 
+            self._triangle_indices,
             new_triangles
         ], dim=0)
+
+        # image_size/importance_score are running maxima and are meant to reset
+        # below; patch ids are identity, so they are appended, never rebuilt
+        if getattr(self, "face_patch", None) is not None and self.face_patch.numel():
+            if new_face_patch is None:
+                new_face_patch = torch.zeros(new_triangles.shape[0], dtype=torch.int32,
+                                             device=self.face_patch.device)
+            self.face_patch = torch.cat(
+                [self.face_patch,
+                 new_face_patch.to(torch.int32).to(self.face_patch.device)])
+            assert self.face_patch.shape[0] == self._triangle_indices.shape[0], \
+                "face_patch fell out of step with the triangle array"
 
         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
         self.importance_score = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
@@ -556,6 +621,8 @@ class TriangleModel:
                 self.image_size = self.image_size[valid_tris]
             if isinstance(self.importance_score, torch.Tensor) and self.importance_score.numel() > 0:
                 self.importance_score = self.importance_score[valid_tris]
+            if getattr(self, "face_patch", None) is not None and self.face_patch.numel() > 0:
+                self.face_patch = self.face_patch[valid_tris]
 
         # Prune vertex-related parameters using the initial mask
         self._prune_vertex_optimizer(vertex_mask)
@@ -601,6 +668,8 @@ class TriangleModel:
 
         self.image_size = self.image_size[mask]
         self.importance_score = self.importance_score[mask]
+        if getattr(self, "face_patch", None) is not None and self.face_patch.numel():
+            self.face_patch = self.face_patch[mask]
         
 
     def _sample_alives(self, probs, num, alive_indices=None):
@@ -640,7 +709,18 @@ class TriangleModel:
 
         (new_vertices, new_vertex_weight, new_features_dc, new_features_rest, new_triangles) = self._update_params_fast(add_idx, iteration)
 
-        self.densification_postfix(new_vertices, new_vertex_weight, new_features_dc, new_features_rest, new_triangles)
+        # _update_params_fast sorts with the same torch.unique and emits exactly
+        # four children per parent, in that order, so the children's patch ids
+        # are the parents' repeated four times
+        new_face_patch = None
+        if getattr(self, "face_patch", None) is not None and self.face_patch.numel():
+            parents = torch.unique(add_idx)
+            assert new_triangles.shape[0] == 4 * parents.numel(), \
+                "1->4 split emitted an unexpected number of children"
+            new_face_patch = self.face_patch[parents].repeat_interleave(4)
+
+        self.densification_postfix(new_vertices, new_vertex_weight, new_features_dc, new_features_rest, new_triangles,
+                                   new_face_patch=new_face_patch)
 
         mask = torch.ones(self._triangle_indices.shape[0], dtype=torch.bool)
         mask[add_idx] = False

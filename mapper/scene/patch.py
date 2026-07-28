@@ -198,9 +198,15 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
 
     # --- 4. PSLG: densify each ring; no crossings are possible ------------
     with tic("pslg"):
+        # the map's real boundary edges, so densification can leave them intact
+        model_edges = None
+        if model_loops:
+            model_edges = np.unique(np.concatenate(
+                [edge_key(r, np.roll(r, -1)) for r in model_loops]))
+
         P, S, ids, off = [], [], [], 0
         for xy, vid in zip(rings, ring_ids):
-            xy2, id2 = _densify_ring(xy, vid, min_dist * 1.5)
+            xy2, id2 = _densify_ring(xy, vid, min_dist * 1.5, model_edges)
             k = len(xy2)
             idx = np.arange(off, off + k)
             P.append(xy2)
@@ -287,6 +293,13 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
     ids_full = ids_full[used]
     count("n_ids_ge0", int((ids_full >= 0).sum()))
 
+    # --- 8b. seam vertices that land inside an existing model edge --------
+    with tic("edge_splits"):
+        splits, snaps = seam_edge_splits(V, ids_full, faces_np,
+                                         rings_uv, rings_id, model_edges)
+        for k, gid in snaps.items():          # close enough to weld outright
+            ids_full[k] = gid
+
     # --- 9. back-project -------------------------------------------------
     with tic("backproject"):
         verts2d = torch.from_numpy(V).float().to(device)
@@ -309,12 +322,27 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
             src = torch.from_numpy(ids_full[m]).to(device)
             world[m] = model.vertices.detach()[src].to(world.dtype)
 
+        # A vertex that splits a model edge must sit *on* that edge, or the
+        # split would drag the existing surface off to wherever this keyframe's
+        # depth happened to land. Same reasoning as the exact-match override.
+        if splits and model is not None:
+            mv = model.vertices.detach()
+            k = torch.tensor([s[0] for s in splits], dtype=torch.long, device=device)
+            a = torch.tensor([s[1] for s in splits], dtype=torch.long, device=device)
+            b = torch.tensor([s[2] for s in splits], dtype=torch.long, device=device)
+            t = torch.tensor([s[3] for s in splits], dtype=world.dtype,
+                             device=device)[:, None]
+            world[k] = mv[a] * (1 - t) + mv[b] * t
+
     if not (z > 0).all():
         print(f"[seed_patch] {(z <= 0).sum().item()} vertices with zero depth")
 
     patch = Patch(vertices=world,
                   faces=torch.from_numpy(faces_np).to(device),
                   colors=kf.rgb[v, u], age=kf.index)
+    # (patch vertex, model vertex a, model vertex b, t) -- the map's own edge
+    # (a,b) has to be split at t when this patch is welded
+    patch.edge_splits = splits
 
     if not debug:
         return patch, None, ids_full
@@ -472,45 +500,81 @@ def boundary_halfedges(faces):
     return de[cnt[inv.ravel()] == 1].astype(np.int64)
 
 
-def boundary_loops(faces, n_vertices):
+def edge_key(a, b):
+    """Order-independent packed key for an undirected edge. Vectorised."""
+    a = np.asarray(a, np.int64)
+    b = np.asarray(b, np.int64)
+    return (np.minimum(a, b) << 32) | np.maximum(a, b)
+
+
+def halfedge_maps(faces):
+    """(he, twin, nxt) for a triangle soup.
+
+    Half-edge `3f+i` runs from face f's vertex i to vertex (i+1)%3, so `nxt` is
+    arithmetic. `twin[h]` is the opposing half-edge, or -1 on the boundary. An
+    edge carrying three or more half-edges is non-manifold; those are left with
+    twin -1 so they read as boundary rather than silently pairing off two of
+    the three arbitrarily.
+    """
+    f = np.asarray(faces, np.int64)
+    n = len(f)
+    he = np.stack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], 1).reshape(-1, 2)
+    idx = np.arange(3 * n)
+    nxt = 3 * (idx // 3) + (idx + 1) % 3
+
+    order = np.argsort(edge_key(he[:, 0], he[:, 1]), kind="stable")
+    ks = edge_key(he[:, 0], he[:, 1])[order]
+    twin = np.full(3 * n, -1, np.int64)
+    start = np.flatnonzero(np.r_[True, ks[1:] != ks[:-1]])
+    run = np.diff(np.r_[start, len(ks)])
+    pair = start[run == 2]
+    twin[order[pair]] = order[pair + 1]
+    twin[order[pair + 1]] = order[pair]
+    if (run > 2).any():
+        count("n_nonmanifold_edges", int((run > 2).sum()))
+    return he, twin, nxt
+
+
+def boundary_loops(faces, n_vertices=None):
     """Chain the boundary half-edges into oriented closed rings.
 
     Returns a list of vertex-index arrays, each a ring with no repeated last
-    point. Rings passing through a pinch vertex -- one with several outgoing
-    boundary half-edges, which happens whenever the kept region narrows to a
-    point -- are resolved by walking the half-edge fan, because the naive
-    next-pointer assignment silently fuses two rings into a garbage one.
+    point.
+
+    The successor of boundary half-edge (u,v) is found by rotating around v
+    through the face fan -- `nxt`, then `twin`, until a half-edge has no twin --
+    not by picking any unused outgoing boundary half-edge. At a pinch vertex,
+    one the boundary passes through twice, the arbitrary choice fuses two rings
+    into a figure-eight, which then projects to a self-touching polygon and
+    makes the seam boolean subtract the wrong region. Welding creates pinch
+    vertices routinely: any new patch touching an old one at a single corner
+    makes one.
     """
-    de = boundary_halfedges(faces)
-    if len(de) == 0:
+    f = np.asarray(faces, np.int64)
+    if len(f) == 0:
         return []
-    src, dst = de[:, 0], de[:, 1]
-    fan = np.bincount(src, minlength=n_vertices)
-    count("n_pinch_vertices", int((fan > 1).sum()))
+    he, twin, nxt = halfedge_maps(f)
+    bnd = np.flatnonzero(twin < 0)
+    if len(bnd) == 0:
+        return []
 
-    # Multiple boundary half-edges leaving a vertex: keep them all and pick the
-    # one that continues the ring we arrived on.
-    outgoing = {}
-    for a, b in de:
-        outgoing.setdefault(int(a), []).append(int(b))
+    nv = n_vertices if n_vertices else int(he.max()) + 1
+    count("n_pinch_vertices",
+          int((np.bincount(he[bnd, 0], minlength=nv) > 1).sum()))
 
-    used = set()
+    seen = np.zeros(len(he), bool)
     loops = []
-    for a0, b0 in de:
-        a0, b0 = int(a0), int(b0)
-        if (a0, b0) in used:
+    for h0 in bnd:
+        if seen[h0]:
             continue
-        ring = []
-        a, b = a0, b0
-        while True:
-            used.add((a, b))
-            ring.append(a)
-            nxt = [c for c in outgoing.get(b, []) if (b, c) not in used]
-            if not nxt:
-                break
-            a, b = b, nxt[0]
-            if (a, b) == (a0, b0):
-                break
+        ring, h = [], int(h0)
+        while not seen[h]:
+            seen[h] = True
+            ring.append(int(he[h, 0]))
+            g = int(nxt[h])
+            while twin[g] >= 0:              # rotate around the shared vertex
+                g = int(nxt[twin[g]])
+            h = g
         if len(ring) >= 3:
             loops.append(np.asarray(ring, np.int64))
     return loops
@@ -760,10 +824,96 @@ def seam_boolean(cov_loops, cov_is_hole, model_uv, model_ids,
     return rings, ring_ids, np.array(holes_xy, np.float64).reshape(-1, 2), stats
 
 
-def _densify_ring(xy, ids, max_len):
-    """Split ring edges longer than max_len. Original vertices survive exactly."""
+def seam_edge_splits(V2d, ids_full, faces_np, rings_uv, rings_id, model_edges,
+                     tol=ID_TOL, t_eps=0.05):
+    """Seam vertices that land inside an existing model boundary edge.
+
+    Where the validity contour crosses the map's outline, the boolean puts a
+    brand-new vertex (id -1) partway along a model edge. That edge belongs to a
+    face nobody is splitting, so welding as-is leaves a T-junction that opens
+    into a crack the moment the vertices move. These are the ones that have to
+    be resolved by splitting the model's own face.
+
+    Returns (splits, snaps): `splits` is a list of (patch_vertex, a, b, t) and
+    `snaps` maps patch_vertex -> model vertex for crossings that landed close
+    enough to an endpoint to be an ordinary weld instead.
+    """
+    splits, snaps = [], {}
+    if not rings_uv or model_edges is None or not len(model_edges):
+        return splits, snaps
+
+    # candidate seam vertices: on this patch's own boundary, carrying no id
+    cand = [k for r in boundary_loops(faces_np, len(V2d)) for k in r
+            if ids_full[k] < 0]
+    if not cand:
+        return splits, snaps
+    cand = np.asarray(sorted(set(cand)), np.int64)
+    P = V2d[cand]
+
+    # every genuine model boundary edge, as a projected 2-D segment
+    A, B, IA, IB = [], [], [], []
+    for uv, vid in zip(rings_uv, rings_id):
+        a, b = vid, np.roll(vid, -1)
+        ok = (a >= 0) & (b >= 0)
+        if not ok.any():
+            continue
+        k = edge_key(np.where(ok, a, 0), np.where(ok, b, 0))
+        pos = np.clip(np.searchsorted(model_edges, k), 0, len(model_edges) - 1)
+        ok &= model_edges[pos] == k
+        if not ok.any():
+            continue
+        A.append(uv[ok]); B.append(np.roll(uv, -1, 0)[ok])
+        IA.append(a[ok]); IB.append(b[ok])
+    if not A:
+        return splits, snaps
+    A = np.concatenate(A); B = np.concatenate(B)
+    IA = np.concatenate(IA); IB = np.concatenate(IB)
+
+    AB = B - A
+    L2 = np.maximum((AB ** 2).sum(1), 1e-12)
+    for i, p in zip(cand, P):
+        t = (((p - A) * AB).sum(1) / L2).clip(0.0, 1.0)
+        d = np.linalg.norm(p - (A + t[:, None] * AB), axis=1)
+        j = int(np.argmin(d))
+        if d[j] > tol:
+            continue
+        L = float(np.sqrt(L2[j]))
+        if t[j] * L < t_eps:                       # effectively at an endpoint
+            snaps[int(i)] = int(IA[j])
+        elif (1.0 - t[j]) * L < t_eps:
+            snaps[int(i)] = int(IB[j])
+        else:
+            splits.append((int(i), int(IA[j]), int(IB[j]), float(t[j])))
+    count("n_seam_edge_splits", len(splits))
+    count("n_seam_endpoint_snaps", len(snaps))
+    return splits, snaps
+
+
+def _densify_ring(xy, ids, max_len, model_edges=None):
+    """Split ring edges longer than max_len. Original vertices survive exactly.
+
+    A ring edge that *is* an existing model boundary edge is never split. The
+    inserted point would carry id -1, land in the interior of that edge, and be
+    back-projected onto the measured surface rather than onto the edge itself --
+    a T-junction against a model face that nobody splits, i.e. a crack. Nothing
+    is lost by leaving it: `-Y` stops Triangle splitting the segment anyway.
+
+    `model_edges` must be the sorted packed keys of the real boundary edges.
+    Testing "both endpoints carry an id" is not enough: `project_loops` drops
+    consecutive duplicates after grid-snapping, and the boolean can emit a chord
+    joining two model vertices that share no edge -- suppressing those costs a
+    long unsplittable triangle for no topological gain.
+    """
     d = np.linalg.norm(np.diff(xy, axis=0, append=xy[:1]), axis=1)
     n = np.maximum(1, np.ceil(d / max_len).astype(np.int64))
+    if model_edges is not None and len(model_edges) and len(ids):
+        a, b = ids, np.roll(ids, -1)
+        both = (a >= 0) & (b >= 0)
+        k = edge_key(np.where(both, a, 0), np.where(both, b, 0))
+        pos = np.clip(np.searchsorted(model_edges, k), 0, len(model_edges) - 1)
+        on_model = both & (model_edges[pos] == k)
+        count("n_model_edges_kept_whole", int(on_model.sum()))
+        n = np.where(on_model, 1, n)
     idx = np.repeat(np.arange(len(xy)), n)
     k = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
     t = (k / np.repeat(n, n))[:, None]

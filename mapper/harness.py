@@ -13,6 +13,7 @@ from arguments import PipelineParams
 from argparse import ArgumentParser
 from utils.timing import tic, frame_end, report
 from utils.gt_depth import GtDepthSource, depth_dir_for
+from scene.global_mesh import GlobalMesh
 import torchvision
 import matplotlib.pyplot as cm
 
@@ -56,59 +57,52 @@ class Keyframe:
 
 class TriangleMapper:
     def __init__(self, device="cuda:0", debug=True, use_occlusion=True,
-                 gt_depth=None):
+                 gt_depth=None, verify_mesh=False):
         self.out_dir = "keyframe_debug/"
         self.device = device
-        self.patches = []
+        self.mesh = GlobalMesh(device=device)
         self.debug = debug                  # seam tile + age view; both debug-only
         self.use_occlusion = use_occlusion
         self.gt_depth = gt_depth            # GtDepthSource or None
+        self.verify_mesh = verify_mesh
         self._n_seen = 0
-        self._model_cache = {}   # (colors_mode, n_patches) -> TriangleModel
+        self._model_cache = {}   # (colors_mode, mesh version) -> TriangleModel
+
+    @property
+    def patches(self):
+        return self.mesh.patches
 
     def is_empty(self):
-        return len(self.patches) == 0
+        return self.mesh.is_empty()
 
     def _build_model(self, colors_mode="rgb"):
-        """Aggregate all patches into a TriangleModel for rendering.
+        """A TriangleModel over the welded mesh.
 
-        Cached on (mode, patch count): this used to run three times per
-        keyframe, each time re-allocating every nn.Parameter and redoing RGB2SH
-        over the whole map.
+        Keyed on the mesh version, not the patch count: welding mutates the mesh
+        in place, so two different meshes can have the same number of patches.
         """
-        key = (colors_mode, len(self.patches))
+        key = (colors_mode, self.mesh.version)
         if key in self._model_cache:
             return self._model_cache[key]
-        with tic("build_model"):
-            tm = TriangleModel(sh_degree=0)
-            verts, faces, colors, off = [], [], [], 0
-            for p in self.patches:
-                verts.append(p.vertices)
-                faces.append(p.faces + off)
-                off += len(p.vertices)
-                colors.append(p.age_colors if colors_mode == "age" else p.colors)
-            tm.populate_triangle_model(torch.cat(verts), torch.cat(faces),
-                                       torch.cat(colors), FIXED_SIGMA)
-            with torch.no_grad():
-                tm.vertex_weight.fill_(20.0)
-        # drop entries from earlier keyframes, keep both colour modes of this one
+        tm = self.mesh.to_triangle_model(
+            colors_mode=colors_mode, sigma=FIXED_SIGMA, weight=20.0,
+            age_to_color=lambda a: age_to_color(a, device=self.device))
+        # drop entries from earlier versions, keep both colour modes of this one
         self._model_cache = {k: v for k, v in self._model_cache.items()
-                             if k[1] == len(self.patches)}
+                             if k[1] == self.mesh.version}
         self._model_cache[key] = tm
         return tm
 
     def _model_boundary_loops(self):
-        """Global boundary rings, from each patch's cached rings plus its offset.
+        """Global boundary rings of the welded mesh.
 
-        Never re-derived from the global face array -- that was an O(3T) pass
-        per keyframe over a mesh that grows linearly.
+        Was the offset-concatenation of each patch's own rings, which is wrong
+        once anything welds: a welded seam edge has two faces from two different
+        patches, so it is interior to the map, yet each patch on its own still
+        reports it as boundary. Projecting those would make the seam boolean
+        subtract regions that are no longer frontier.
         """
-        loops, off = [], 0
-        for p in self.patches:
-            for ring in p.boundary_loops():
-                loops.append(ring + off)
-            off += len(p.vertices)
-        return loops
+        return self.mesh.boundary_loops()
 
     def _render(self, kf, colors_mode="rgb"):
         tm = self._build_model(colors_mode=colors_mode)
@@ -137,7 +131,8 @@ class TriangleMapper:
         invalid_mask = (kf.depth <= 0) if kf.is_gt_depth else None
 
         tm, loops, rendered_depth = None, None, None
-        if self.patches:
+        seed_version = self.mesh.version     # ids are captured against this
+        if not self.mesh.is_empty():
             tm = self._build_model(colors_mode="rgb")
             loops = self._model_boundary_loops()
             if self.use_occlusion:
@@ -158,16 +153,25 @@ class TriangleMapper:
         save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"), ids)
 
         patch.age = record.index
-        color = age_to_color(record.index, device=self.device)  # (3,)
-        patch.age_colors = color.unsqueeze(0).expand(patch.vertices.shape[0], 3).contiguous()  # (V,3)
-        self.patches.append(patch)
+        b_before = self.mesh.boundary_edge_count()
+        rec = self.mesh.weld(patch, ids, kf_index=record.index,
+                             seed_version=seed_version,
+                             splits=getattr(patch, "edge_splits", None))
+        if self.verify_mesh:
+            problems = self.mesh.verify(full=True)
+            if problems:
+                print("[mesh] " + "; ".join(problems))
 
         # self.optimize() ; self.anneal() ; self.densify()
 
         self.dump_views(kf, self.out_dir, image)
         n_weld = int((ids >= 0).sum()) if ids is not None else 0
-        print(f"kf {record.index}: {len(patch.faces)} tris, {len(self.patches)} patches, "
-              f"{n_weld} weldable verts")
+        # each welded seam edge closes one boundary edge on each side, so the
+        # boundary grows by less than the patch's own outline
+        b_grew = self.mesh.boundary_edge_count() - b_before
+        print(f"kf {record.index}: {rec.n_faces} tris, {len(self.mesh.patches)} patches, "
+              f"{n_weld} weldable verts, +{rec.n_vertices} new verts, "
+              f"boundary +{b_grew} | {self.mesh.stats()}")
         _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
 
     def _check_depth_alignment(self, kf, rendered_depth, alpha):
@@ -279,6 +283,8 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--verify_mesh", action="store_true",
+                   help="check mesh invariants after every weld (slow)")
     p.add_argument("--no_gt_depth", action="store_true",
                    help="use the record's SLAM depth even if <records_dir>_depth exists")
     p.add_argument("--gt_depth_dir", default=None,
@@ -323,7 +329,7 @@ if __name__ == "__main__":
 
     mapper = TriangleMapper(debug=not args.fast,
                             use_occlusion=not args.no_occlusion,
-                            gt_depth=gt)
+                            gt_depth=gt, verify_mesh=args.verify_mesh)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
@@ -331,5 +337,5 @@ if __name__ == "__main__":
             break
         mapper.integrate(record)
 
-    print(f"Done. {len(mapper.patches)} patches from {len(mapper.patches)} keyframes.")
+    print(f"Done. {mapper.mesh.stats()}")
     _log(report())
