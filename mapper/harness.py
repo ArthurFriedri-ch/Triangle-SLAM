@@ -18,15 +18,23 @@ from scene.global_mesh import GlobalMesh
 import torchvision
 import matplotlib.pyplot as cm
 
-# build a real PipelineParams with defaults (render reads pipe.debug, pipe.convert_SHs_python)
-_pipe = PipelineParams(ArgumentParser()).extract(
-    ArgumentParser().parse_args([]))
+# Defaults for the TS+ parameter groups. Both groups must be registered on the
+# SAME parser and extracted from the namespace that parser produces:
+# `ParamGroup.extract` copies whatever it finds in the *parsed* namespace, so
+# building on one parser and parsing another returns an empty GroupParams. That
+# went unnoticed for `_pipe` because the only two fields `render` reads are
+# assigned by hand below; `_opt` has thirty-one and needs them all.
+_defaults_parser = ArgumentParser()
+_pipe_group = PipelineParams(_defaults_parser)
+_opt_group = OptimizationParams(_defaults_parser)
+_defaults = _defaults_parser.parse_args([])
+
+_pipe = _pipe_group.extract(_defaults)
 _pipe.debug = True
 _pipe.convert_SHs_python = False
-# TS+ optimisation defaults (learning rates, lambda_dssim, ...); the few
-# values that matter per-run are overridden from the command line below.
-_opt = OptimizationParams(ArgumentParser()).extract(
-    ArgumentParser().parse_args([]))
+# learning rates, lambda_dssim, ...; the few values that matter per-run are
+# overridden from the command line below.
+_opt = _opt_group.extract(_defaults)
 _BG = torch.tensor([0., 0., 0.], device="cuda")  # black background
 
 background = torch.tensor([0., 0., 0.], device="cuda")  # black bg
@@ -428,8 +436,10 @@ if __name__ == "__main__":
                         "(TS+ trains from 1.0)")
     p.add_argument("--sigma_final", type=float, default=None,
                    help="softness to anneal towards; default: no annealing")
-    p.add_argument("--sigma_until", type=float, default=0.0,
-                   help="seconds of record time over which sigma anneals")
+    p.add_argument("--sigma_until_seconds", type=float, default=0.0,
+                   help="record seconds over which sigma anneals from --sigma "
+                        "to --sigma_final. Named to distinguish it from TS+'s "
+                        "sigma_until, which counts iterations")
     p.add_argument("--opacity", type=float, default=INIT_OPACITY,
                    help=f"initial per-vertex opacity in (0,1); default {INIT_OPACITY}")
     p.add_argument("--iters_per_second", type=float, default=0.0,
@@ -506,7 +516,7 @@ if __name__ == "__main__":
                             occlusion_min_area=args.occlusion_min_area,
                             min_region_frac=args.min_region_frac,
                             sigma=args.sigma, sigma_final=args.sigma_final,
-                            sigma_until_s=args.sigma_until,
+                            sigma_until_s=args.sigma_until_seconds,
                             opacity=args.opacity,
                             iters_per_second=args.iters_per_second,
                             record_fps=args.record_fps,
