@@ -56,9 +56,10 @@ class GtDepthSource:
     """Maps records to ground-truth depth PNGs in a sibling `*_depth` folder."""
 
     def __init__(self, depth_dir, png_scale=None, align="per_frame",
-                 undistort="auto", max_depth=50.0):
+                 undistort="auto", max_depth=50.0, force_strategy=None):
         self.dir = depth_dir
         self.png_scale = png_scale
+        self.force_strategy = force_strategy
         if align is True:
             align = "per_frame"
         elif align is False:
@@ -120,7 +121,15 @@ class GtDepthSource:
         list from rgb.txt alone -- so the record's timestamp is rgb_ts[index],
         and the depth frame is whichever is nearest in time.
         """
-        for base in (self.dir, os.path.dirname(os.path.normpath(self.dir))):
+        # Only look beside the folder when it is literally a TUM `depth/`
+        # directory. Searching the parent unconditionally is unsafe: for
+        # `data/office0_records_depth` the parent is `data/`, shared by every
+        # dataset, so one stray rgb.txt there would silently repair-pair
+        # Replica -- which is synthetic and needs no association at all.
+        bases = [self.dir]
+        if os.path.basename(os.path.normpath(self.dir)) == "depth":
+            bases.append(os.path.dirname(os.path.normpath(self.dir)))
+        for base in bases:
             rgb_txt = os.path.join(base, "rgb.txt")
             dep_txt = os.path.join(base, "depth.txt")
             if os.path.isfile(rgb_txt) and os.path.isfile(dep_txt):
@@ -257,7 +266,14 @@ class GtDepthSource:
                 f"{float(K[0, 0]):.1f})")
 
         saved_scale, self.scale = self.scale, 1.0
-        if self._assoc is not None:
+        if self.force_strategy:
+            self.strategy = self.force_strategy
+            best_corr = self._score(records)
+            if best_corr is None:
+                raise RuntimeError(
+                    f"forced mapping {self.force_strategy} matched no records "
+                    f"in {self.dir}")
+        elif self._assoc is not None:
             # The dataset ships its own pairing. Do not put that in a contest
             # against positional guesses: consecutive depth frames at 30 Hz are
             # nearly identical, and against a noisy monocular depth estimate the
@@ -269,14 +285,32 @@ class GtDepthSource:
             self.strategy = "assoc"
             best_corr = self._score(records)
         else:
-            best, best_corr = None, -np.inf
-            for strat in ([f"stem:{p}" for p in _STEM_PATTERNS]
-                          + ["index", "ordinal"]):
-                self.strategy = strat
-                c = self._score(records)
-                if c is not None and c > best_corr:
-                    best, best_corr = strat, c
-            self.strategy = best
+            # A filename that encodes the record index is an explicit pairing,
+            # so accept it structurally the way `assoc` is accepted. Replica is
+            # synthetic with rgb and depth rendered 1:1, and depth{index}.png
+            # says so outright -- there is nothing to arbitrate. Correlation
+            # must not decide it: here it compares a clean synthetic depth map
+            # against monocular SLAM depth, and a positional mapping can score
+            # higher than the correct one, exactly as it did on TUM.
+            self.strategy = None
+            for p in _STEM_PATTERNS:
+                cand = f"stem:{p}"
+                self.strategy = cand
+                if all(self._path_for(r, i) is not None
+                       for i, r in enumerate(records)):
+                    break
+                self.strategy = None
+            if self.strategy is not None:
+                best_corr = self._score(records)
+            else:
+                # nothing structural to go on; positional guesses get scored
+                best, best_corr = None, -np.inf
+                for strat in ("index", "ordinal"):
+                    self.strategy = strat
+                    c = self._score(records)
+                    if c is not None and c > best_corr:
+                        best, best_corr = strat, c
+                self.strategy = best
         self._map_corr = best_corr
         self.scale = saved_scale
 
@@ -284,12 +318,23 @@ class GtDepthSource:
             raise RuntimeError(
                 f"could not match any record to a PNG in {self.dir}. "
                 f"Files look like: {[os.path.basename(f) for f in self.files[:3]]}")
-        if best_corr < min_corr:
+        # A hard floor applies only to *guessed* pairings. `assoc` and a
+        # filename carrying the record index are explicit statements about which
+        # depth belongs to which keyframe, and that evidence outranks a
+        # correlation against noisy monocular depth -- which we have twice seen
+        # rank a wrong mapping above the right one. A low score there still
+        # means something is off, but it is not the pairing.
+        if best_corr < min_corr and not self.force_strategy:
             raise RuntimeError(
                 f"mapping {self.strategy} correlates only {best_corr:.2f} with "
-                f"the record depth, below {min_corr}. The PNGs are probably "
-                f"misaligned with the keyframes. Files look like: "
-                f"{[os.path.basename(f) for f in self.files[:3]]}")
+                f"the record depth, below {min_corr}. Even an explicit-looking "
+                f"pairing can be wrong: office0's records embed a gt_depth that "
+                f"matches depth<index>.png only for the first few keyframes and "
+                f"then drifts, so the record index is not that dataset's frame "
+                f"number. Refusing rather than seeding from depth belonging to "
+                f"another frame. Files look like: "
+                f"{[os.path.basename(f) for f in self.files[:3]]}. Override with "
+                f"--gt_depth_map if you know the pairing is right.")
         self._report.append(
             f"mapping={self.strategy} (depth correlation {best_corr:.3f})")
         if self.strategy == "assoc":

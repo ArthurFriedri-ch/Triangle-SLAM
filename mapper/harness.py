@@ -292,6 +292,10 @@ if __name__ == "__main__":
                         "scale that also drifts along the trajectory; "
                         "'none' will not match the camera baselines at all and "
                         "'global' will drift away from them.")
+    p.add_argument("--gt_depth_map", default=None,
+                   help="force the index->file mapping, e.g. 'assoc', "
+                        "'stem:depth{i:06d}', 'index', 'ordinal' "
+                        "(default: auto-detect)")
     p.add_argument("--gt_depth_probe", type=int, default=8,
                    help="keyframes used to calibrate the mapping and scale")
     args = p.parse_args()
@@ -313,7 +317,8 @@ if __name__ == "__main__":
             pick = np.linspace(0, len(paths) - 1, n).round().astype(int)
             probe = [slam_interface.read(paths[i]) for i in sorted(set(pick))]
             gt = GtDepthSource(gt_dir, png_scale=args.gt_depth_scale,
-                               align=args.gt_depth_align).calibrate(probe)
+                               align=args.gt_depth_align,
+                               force_strategy=args.gt_depth_map).calibrate(probe)
             print(gt.summary())
 
     mapper = TriangleMapper(debug=not args.fast,
