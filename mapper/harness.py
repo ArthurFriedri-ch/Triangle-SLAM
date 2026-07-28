@@ -59,6 +59,7 @@ FIXED_SIGMA = 0.001
 # Initial per-vertex opacity in (0,1). Stored as a logit internally; the old
 # hard-coded vertex_weight of 20.0 was that logit, i.e. opacity ~1.0.
 INIT_OPACITY = 0.99
+AGE_MAX_PATCHES = 200
 
 
 class Keyframe:
@@ -204,6 +205,7 @@ class TriangleMapper:
         if patch is None:
             print(f"kf {record.index}: no patch seeded, skipping")
             _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
+            self.record_frame()      # hold the frame; the map did not change
             return
 
         save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"), ids)
@@ -245,6 +247,7 @@ class TriangleMapper:
               f"boundary +{b_grew} | {self.mesh.stats()}"
               + (f" | opt loss {opt_loss:.4f}" if opt_loss is not None else ""))
         _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
+        self.record_frame()
 
     def optimize(self, n_iters, kf_index):
         """TS+ photometric refinement over a window of recent keyframes.

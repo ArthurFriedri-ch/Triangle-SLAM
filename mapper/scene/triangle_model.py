@@ -293,7 +293,14 @@ class TriangleModel:
         device = "cuda"
         V = vertices.shape[0]
 
-        _points = vertices.float().to(device)
+        # detach().clone(): `.float().to(device)` is a no-op returning the SAME
+        # tensor when the input is already float32 on that device, so without
+        # this the model's Parameter shares storage with the caller's array --
+        # `requires_grad_(True)` below then flips the caller's tensor to a grad
+        # leaf, every model built from one mesh aliases every other, and an
+        # optimiser step rewrites the source geometry with nothing to signal it
+        # changed. A model must own its parameters.
+        _points = vertices.detach().clone().float().to(device)
 
         # --- features: RGB -> SH, DC term only (degree 0), rest zeroed ---
         fused_color = RGB2SH(colors.float().to(device))  # (V,3)
