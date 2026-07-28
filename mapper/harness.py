@@ -1,18 +1,19 @@
 # mapper/harness.py
 import argparse
 import os
+import time
 
 import torch
 
-from scene.patch import (seed_patch, OCCLUSION_REL, OCCLUSION_MIN_AREA,
-                        MIN_REGION_FRAC)
+from scene.patch import (seed_patch, boundary_halfedges, OCCLUSION_REL,
+                        OCCLUSION_MIN_AREA, MIN_REGION_FRAC)
 import slam_interface
 from scene.cameras import Camera
 import numpy as np, math
 from triangle_renderer import render, TriangleModel
 from arguments import PipelineParams, OptimizationParams
 from argparse import ArgumentParser
-from utils.timing import tic, count, frame_end, report
+from utils.timing import tic, count, frame_end, report, totals
 from utils.gt_depth import GtDepthSource, depth_dir_for
 from scene.global_mesh import GlobalMesh
 import torchvision
@@ -118,6 +119,7 @@ class TriangleMapper:
         self._video_n = 0
         self._t0 = None
         self._last_t = None
+        self._t0_wall = time.perf_counter()
         self._tail_t = None   # seconds into the tail; None while seeding
         self.gt_depth = gt_depth            # GtDepthSource or None
         self.verify_mesh = verify_mesh
@@ -264,6 +266,8 @@ class TriangleMapper:
         patch.age = record.index
         b_before = self.mesh.boundary_edge_count()
         v_before = len(self.mesh.vertices)
+        count("n_patch_boundary_edges",
+              len(boundary_halfedges(patch.faces.detach().cpu().numpy())))
         rec = self.mesh.weld(patch, ids, kf_index=record.index,
                              seed_version=seed_version,
                              splits=getattr(patch, "edge_splits", None))
@@ -452,6 +456,79 @@ class TriangleMapper:
                     losses.append(got)
             self.record_frame()
         return float(np.mean(losses)) if losses else None
+
+    def summary(self):
+        """End-of-run accounting: where the time went and what came out."""
+        stage, sums, _ = totals()
+        wall = time.perf_counter() - self._t0_wall
+        g = lambda k: stage.get(k, 0.0)
+
+        # `seed_patch` wraps the whole CDT, and the entries below it are nested
+        # inside it -- listing them as siblings would double count
+        cdt = g("seed_patch")
+        cdt_parts = [("region contour", g("region_loops")),
+                     ("project map outline", g("project_loops")),
+                     ("seam boolean", g("seam_boolean")),
+                     ("PSLG + densify", g("pslg")),
+                     ("masks", g("masks")),
+                     ("interior seeds", g("seeds")),
+                     ("triangulate", g("triangulate")),
+                     ("edge splits", g("edge_splits")),
+                     ("back-project", g("backproject")),
+                     ("debug tile", g("debug_render"))]
+        opt = g("optimize")
+        integ = g("weld") + g("grow_model") + g("boundary_rings")
+        rend = g("render") + g("video_render") + g("to_triangle_model")
+        acct = cdt + opt + integ + rend
+
+        m, kfs = self.mesh, self._n_seen
+        n_patch = len(m.patches)
+        rec_s = (self._last_t or 0.0) + (self._tail_t or 0.0)
+        own = sums.get("n_patch_boundary_edges", 0)
+
+        L = ["", "=" * 68,
+             f"  {kfs} keyframes -> {n_patch} patches"
+             f"{f' ({kfs - n_patch} skipped)' if kfs > n_patch else ''}",
+             "=" * 68,
+             f"  wall clock            {wall:8.1f} s",
+             f"    CDT seeding         {cdt:8.1f} s  {100*cdt/max(wall,1e-9):5.1f}%"
+             f"   {cdt/max(n_patch,1):6.3f} s/patch"]
+        for name, v in sorted(cdt_parts, key=lambda kv: -kv[1]):
+            if v > 0.005:
+                L.append(f"        {name:<20}{v:8.1f} s  {100*v/max(cdt,1e-9):5.1f}% of CDT")
+        L += [f"    optimisation        {opt:8.1f} s  {100*opt/max(wall,1e-9):5.1f}%",
+              f"    integration         {integ:8.1f} s  {100*integ/max(wall,1e-9):5.1f}%"
+              f"   (weld, model grow, boundary rings)",
+              f"    rendering           {rend:8.1f} s  {100*rend/max(wall,1e-9):5.1f}%",
+              f"    unaccounted         {wall-acct:8.1f} s  "
+              f"{100*(wall-acct)/max(wall,1e-9):5.1f}%   (I/O, depth decode, encode)",
+              ""]
+
+        rate = (f", {self._step/opt:.0f}/s wall" if opt > 0.01 else "")
+        L += [f"  optimisation    {self._step} iterations{rate}, "
+              f"{self._step/max(n_patch,1):.0f} per patch",
+              f"                  sigma {self.sigma0:g} -> {self._sigma_at(0):g}, "
+              f"window {self.opt_window} keyframes, geometry "
+              f"{'unfrozen' if self._step >= 1000 else f'STILL FROZEN ({1000-self._step} steps short)'}",
+              f"  map             {len(m.vertices)} vertices, {len(m.faces)} faces, "
+              f"{m.boundary_edge_count()} boundary edges"]
+        if own:
+            L.append(f"                  seam closure {100*(1-m.boundary_edge_count()/own):.0f}% "
+                     f"({own} edges if patches had stayed separate)")
+        L += [f"  welding         {sums.get('n_weld_reused',0)} vertices reused, "
+              f"{sums.get('n_weld_new',0)} added, "
+              f"{m.n_splits_applied} edge splits ({m.n_splits_skipped} skipped)",
+              f"                  {m.n_faces_rejected} faces refused "
+              f"(degenerate, duplicate or non-manifold)"]
+        if rec_s > 0:
+            L.append(f"  throughput      {rec_s:.1f} s of record in {wall:.1f} s wall "
+                     f"= {rec_s/max(wall,1e-9):.2f}x real time, "
+                     f"{wall/max(kfs,1):.2f} s/keyframe")
+        if self._video_n:
+            L.append(f"  video           {self._video_n} frames at {self._video_fps} fps "
+                     f"= {self._video_n/max(self._video_fps,1):.1f} s")
+        L.append("=" * 68)
+        return "\n".join(L)
 
     def _sigma_at(self, kf_index):
         """Softness: held at --sigma while keyframes arrive, annealed after.
@@ -814,5 +891,5 @@ if __name__ == "__main__":
     if args.video:
         encode_video(mapper._video_dir, args.video_out, args.video_fps)
 
-    print(f"Done. {mapper.mesh.stats()}")
+    print(mapper.summary())
     _log(report())

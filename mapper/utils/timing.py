@@ -19,6 +19,7 @@ _SYNC = os.environ.get("MAPPER_TIME_CUDA", "0") == "1"
 _times = OrderedDict()   # stage name -> seconds accumulated this frame
 _counts = OrderedDict()  # counter name -> scalar for this frame
 _totals = OrderedDict()  # stage name -> seconds accumulated over the whole run
+_sums = OrderedDict()    # counter name -> summed over the whole run
 _frames = 0
 
 
@@ -35,10 +36,13 @@ def _sync():
 
 @contextmanager
 def tic(name, cuda=False):
-    """Accumulate wall time for `name` within the current frame."""
-    if not ENABLED:
-        yield
-        return
+    """Accumulate wall time for `name`.
+
+    Always on: two perf_counter calls per block is nothing next to what the
+    blocks do, and the end-of-run summary is worth more than that. Only the
+    CUDA syncs (which genuinely distort what they measure) and the per-keyframe
+    CSV stay behind the env vars.
+    """
     if cuda:
         _sync()
     t0 = time.perf_counter()
@@ -54,15 +58,13 @@ def tic(name, cuda=False):
 
 def count(name, value):
     """Record a size for this frame (number of triangles, points, ids, ...)."""
-    if ENABLED:
-        _counts[name] = value
+    _counts[name] = value
+    _sums[name] = _sums.get(name, 0) + (value if isinstance(value, (int, float)) else 0)
 
 
 def frame_end(kf_index, csv_path=None):
     """Close out a keyframe. Appends a CSV row and returns a one-line summary."""
     global _frames
-    if not ENABLED:
-        return ""
     _frames += 1
     total = sum(_times.values())
 
@@ -78,6 +80,10 @@ def frame_end(kf_index, csv_path=None):
                 fh.write(",".join(cols) + "\n")
             fh.write(",".join(str(v) for v in row) + "\n")
 
+    if not ENABLED:
+        _times.clear()
+        _counts.clear()
+        return ""
     hot = sorted(_times.items(), key=lambda kv: -kv[1])[:5]
     summary = "  ".join(f"{k}={v:.2f}s" for k, v in hot)
     sizes = "  ".join(f"{k}={v}" for k, v in _counts.items())
@@ -86,9 +92,14 @@ def frame_end(kf_index, csv_path=None):
     return f"[time] kf {kf_index}  total={total:.2f}s | {summary} | {sizes}"
 
 
+def totals():
+    """(stage -> seconds, counter -> summed value, keyframes) for the whole run."""
+    return dict(_totals), dict(_sums), _frames
+
+
 def report():
     """Aggregate table over the whole run."""
-    if not ENABLED or not _totals:
+    if not _totals:
         return ""
     width = max(len(k) for k in _totals)
     lines = [f"=== stage totals over {_frames} keyframes ==="]
