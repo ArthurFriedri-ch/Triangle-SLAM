@@ -403,6 +403,60 @@ class GlobalMesh:
                 tm.vertex_weight.fill_(math.log(o / (1.0 - o)))
         return tm
 
+    def append_into_model(self, tm, v_before, opacity=0.99):
+        """Extend a live TriangleModel with everything welded since `v_before`.
+
+        The alternative -- rebuilding the model from the mesh -- throws away the
+        optimiser with it, so momentum never accumulates and the learning-rate
+        schedule restarts. `cat_tensors_to_optimizer` grows each parameter and
+        pads Adam's exp_avg/exp_avg_sq with zeros for the new rows, so existing
+        geometry keeps its state and new geometry starts clean.
+
+        Faces are not parameters, so the topology is copied over wholesale --
+        edge splits rewrite an existing face in place, which an append could not
+        express.
+        """
+        from utils.general_utils import inverse_sigmoid
+        from utils.sh_utils import RGB2SH
+
+        dev = tm.vertices.device if len(tm.vertices) else self.device
+        n_new = len(self.vertices) - v_before
+        if n_new > 0:
+            new_v = self.vertices[v_before:].detach().clone().to(dev)
+            new_c = RGB2SH(self.colors[v_before:].detach().clone().to(dev))
+            o = float(min(max(opacity, 1e-4), 1 - 1e-6))
+            d = {
+                "vertices": new_v,
+                "vertex_weight": torch.full((n_new, 1), math.log(o / (1 - o)),
+                                            device=dev),
+                "f_dc": new_c[:, None, :],                       # (n,1,3)
+                "f_rest": torch.zeros((n_new, tm._features_rest.shape[1], 3),
+                                      device=dev),
+            }
+            got = tm.cat_tensors_to_optimizer(d)
+            tm.vertices = got["vertices"]
+            tm.vertex_weight = got["vertex_weight"]
+            tm._features_dc = got["f_dc"]
+            tm._features_rest = got["f_rest"]
+
+        f_before = tm._triangle_indices.shape[0]
+        tm._triangle_indices = torch.from_numpy(self.faces).to(torch.int32).to(dev)
+        tm.face_patch = torch.from_numpy(self.face_patch).to(torch.int32).to(dev)
+        n_faces = tm._triangle_indices.shape[0]
+        for name in ("image_size", "importance_score"):
+            old = getattr(tm, name, None)
+            if not torch.is_tensor(old) or old.numel() == 0:
+                setattr(tm, name, torch.zeros(n_faces, dtype=torch.float, device=dev))
+            elif old.shape[0] < n_faces:                 # keep the running maxima
+                setattr(tm, name, torch.cat(
+                    [old, torch.zeros(n_faces - old.shape[0], dtype=torch.float,
+                                      device=dev)]))
+            elif old.shape[0] > n_faces:
+                setattr(tm, name, old[:n_faces])
+        count("n_model_verts_appended", max(n_new, 0))
+        count("n_model_faces_appended", n_faces - f_before)
+        return tm
+
     def sync_from(self, tm):
         """Pull optimised vertex positions and colours back out of a model.
 

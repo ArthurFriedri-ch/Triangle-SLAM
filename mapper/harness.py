@@ -119,7 +119,9 @@ class TriangleMapper:
         self.gt_depth = gt_depth            # GtDepthSource or None
         self.verify_mesh = verify_mesh
         self._n_seen = 0
-        self._model_cache = {}   # (colors_mode, mesh version) -> TriangleModel
+        self._model = None       # THE model: persistent, optimised in place
+        self._step = 0           # global optimisation step, drives the LR schedule
+        self._age_cache = {}     # mesh version -> throwaway age-coloured model
 
     @property
     def patches(self):
@@ -129,23 +131,40 @@ class TriangleMapper:
         return self.mesh.is_empty()
 
     def _build_model(self, colors_mode="rgb"):
-        """A TriangleModel over the welded mesh.
+        """The live model for rendering.
 
-        Keyed on the mesh version, not the patch count: welding mutates the mesh
-        in place, so two different meshes can have the same number of patches.
+        "rgb" is *the* model -- one object, one optimiser, for the whole run.
+        Rebuilding it per keyframe would discard the optimiser with it, so
+        patches are appended into it instead (see `_grow_model`).
+
+        "age" is a throwaway rebuilt from the mesh whenever it is asked for; it
+        is never trained, it only exists to be looked at.
         """
-        key = (colors_mode, self.mesh.version)
-        if key in self._model_cache:
-            return self._model_cache[key]
-        tm = self.mesh.to_triangle_model(
-            colors_mode=colors_mode, sigma=self.sigma0, opacity=self.opacity,
-            age_to_color=lambda a: age_to_color(
-                a, self.age_max_patches, device=self.device))
-        # drop entries from earlier versions, keep both colour modes of this one
-        self._model_cache = {k: v for k, v in self._model_cache.items()
-                             if k[1] == self.mesh.version}
-        self._model_cache[key] = tm
+        if colors_mode == "rgb":
+            return self._model
+        if self._age_cache.get("version") != self.mesh.version:
+            self._age_cache = {
+                "version": self.mesh.version,
+                "tm": self.mesh.to_triangle_model(
+                    colors_mode="age", sigma=self.sigma0, opacity=self.opacity,
+                    age_to_color=lambda a: age_to_color(
+                        a, self.age_max_patches, device=self.device))}
+        tm = self._age_cache["tm"]
+        tm.set_sigma(self._model.get_sigma if self._model else self.sigma0)
         return tm
+
+    def _grow_model(self, v_before):
+        """Fold everything welded since `v_before` into the live model."""
+        with tic("grow_model"):
+            if self._model is None:
+                self._model = self.mesh.to_triangle_model(
+                    colors_mode="rgb", sigma=self.sigma0, opacity=self.opacity)
+                self._model.training_setup(
+                    _opt, _opt.feature_lr, _opt.weight_lr,
+                    _opt.lr_triangles_points_init)
+            else:
+                self.mesh.append_into_model(self._model, v_before,
+                                            opacity=self.opacity)
 
     def _model_boundary_loops(self):
         """Global boundary rings of the welded mesh.
@@ -185,6 +204,11 @@ class TriangleMapper:
         invalid_mask = (kf.depth <= 0) if kf.is_gt_depth else None
 
         tm, loops, rendered_depth = None, None, None
+        if self._model is not None:
+            # optimisation moves the model's vertices; pull them back so the
+            # weld ids and the edge-split lerps refer to where geometry
+            # actually is, not where it was when the patch was seeded
+            self.mesh.sync_from(self._model)
         seed_version = self.mesh.version     # ids are captured against this
         if not self.mesh.is_empty():
             tm = self._build_model(colors_mode="rgb")
@@ -212,9 +236,13 @@ class TriangleMapper:
 
         patch.age = record.index
         b_before = self.mesh.boundary_edge_count()
+        v_before = len(self.mesh.vertices)
         rec = self.mesh.weld(patch, ids, kf_index=record.index,
                              seed_version=seed_version,
                              splits=getattr(patch, "edge_splits", None))
+        # the new geometry joins the model the optimiser is already working on,
+        # rather than triggering a rebuild that would discard the optimiser
+        self._grow_model(v_before)
         if self.verify_mesh:
             problems = self.mesh.verify(full=True)
             if problems:
@@ -259,15 +287,20 @@ class TriangleMapper:
             return None
         from utils.loss_utils import l1_loss, ssim
 
-        tm = self._build_model(colors_mode="rgb")
-        tm.training_setup(_opt, _opt.feature_lr, _opt.weight_lr,
-                          _opt.lr_triangles_points_init)
+        tm = self._model
+        if tm is None:
+            return None
         views = self._views[-self.opt_window:]
 
         losses = []
         with tic("optimize", cuda=True):
-            for it in range(1, n_iters + 1):
-                tm.update_learning_rate(it)
+            for _ in range(n_iters):
+                # a GLOBAL step count: the schedule, and the 1000-step freeze on
+                # vertex positions, run across the whole session. Feeding a
+                # per-call counter kept the vertex learning rate pinned at zero,
+                # so geometry never moved at all.
+                self._step += 1
+                tm.update_learning_rate(self._step)
                 tm.set_sigma(self._sigma_at(kf_index))
                 cam = views[np.random.randint(len(views))]
 
@@ -293,11 +326,8 @@ class TriangleMapper:
                     tm.optimizer.zero_grad(set_to_none=True)
                 losses.append(loss.item())
 
-        self.mesh.sync_from(tm)
-        # the mesh now matches this model exactly, so keep it rather than
-        # paying for a rebuild on the very next call
-        self._model_cache = {("rgb", self.mesh.version): tm}
         count("n_opt_iters", n_iters)
+        count("opt_step", self._step)
         return float(np.mean(losses)) if losses else None
 
     def start_video(self, kf, colors_mode="rgb", back=1.5, fov_scale=2.0, fps=30,
@@ -317,8 +347,8 @@ class TriangleMapper:
 
     def record_frame(self):
         """Render the map from the fixed overview camera into the next frame."""
-        if self._overview is None:
-            return
+        if self._overview is None or self._model is None:
+            return          # nothing welded yet; the clock still runs
         tm = self._build_model(colors_mode=self._video_mode)
         with tic("video_render", cuda=True):
             pkg = render(self._overview, tm, _pipe, _BG)
