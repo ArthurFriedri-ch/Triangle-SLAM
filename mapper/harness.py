@@ -121,7 +121,7 @@ class TriangleMapper:
         self._n_seen = 0
         self._model = None       # THE model: persistent, optimised in place
         self._step = 0           # global optimisation step, drives the LR schedule
-        self._age_cache = {}     # mesh version -> throwaway age-coloured model
+        self._age_cache = {}     # mesh version -> age SH coefficients
 
     @property
     def patches(self):
@@ -131,27 +131,51 @@ class TriangleMapper:
         return self.mesh.is_empty()
 
     def _build_model(self, colors_mode="rgb"):
-        """The live model for rendering.
+        """The live model -- one object, one optimiser, for the whole run.
 
-        "rgb" is *the* model -- one object, one optimiser, for the whole run.
         Rebuilding it per keyframe would discard the optimiser with it, so
-        patches are appended into it instead (see `_grow_model`).
-
-        "age" is a throwaway rebuilt from the mesh whenever it is asked for; it
-        is never trained, it only exists to be looked at.
+        patches are appended into it instead (see `_grow_model`). The age view
+        renders this same model with the colours swapped; see `_render_age`.
         """
-        if colors_mode == "rgb":
-            return self._model
+        return self._model
+
+    def _age_features(self):
+        """Age colours as SH DC coefficients, shaped like `_features_dc`."""
+        from utils.sh_utils import RGB2SH
         if self._age_cache.get("version") != self.mesh.version:
-            self._age_cache = {
-                "version": self.mesh.version,
-                "tm": self.mesh.to_triangle_model(
-                    colors_mode="age", sigma=self.sigma0, opacity=self.opacity,
-                    age_to_color=lambda a: age_to_color(
-                        a, self.age_max_patches, device=self.device))}
-        tm = self._age_cache["tm"]
-        tm.set_sigma(self._model.get_sigma if self._model else self.sigma0)
-        return tm
+            pids = self.mesh.vertex_patch.astype(np.int64)
+            uniq = np.unique(pids)
+            lut = torch.stack([age_to_color(int(p), self.age_max_patches,
+                                            device=self.device) for p in uniq])
+            cols = lut[torch.from_numpy(np.searchsorted(uniq, pids)).to(self.device)]
+            self._age_cache = {"version": self.mesh.version,
+                               "dc": RGB2SH(cols)[:, None, :]}
+        return self._age_cache["dc"]
+
+    def _render_age(self, cam):
+        """Render the live model recoloured by patch age.
+
+        Only the colours are swapped. Rebuilding a separate model from the mesh
+        instead gave the age view its own *geometry* -- stale, because the mesh
+        is only synced at the start of the next keyframe -- and its own
+        vertex_weight, reset to the initial --opacity rather than the optimised
+        value. At --opacity 0.28 that rendered every triangle at 28% opacity,
+        so the age tile came out soft with the background showing through while
+        the rgb tile beside it looked fine.
+        """
+        tm = self._model
+        if tm is None:
+            return None
+        dc = self._age_features()
+        if dc.shape[0] != tm._features_dc.shape[0]:
+            return None                       # mesh and model briefly disagree
+        saved = tm._features_dc
+        try:
+            tm._features_dc = dc              # attribute swap; Adam holds its own ref
+            with tic("render", cuda=True):
+                return render(cam, tm, _pipe, _BG)
+        finally:
+            tm._features_dc = saved
 
     def _grow_model(self, v_before):
         """Fold everything welded since `v_before` into the live model."""
@@ -349,9 +373,13 @@ class TriangleMapper:
         """Render the map from the fixed overview camera into the next frame."""
         if self._overview is None or self._model is None:
             return          # nothing welded yet; the clock still runs
-        tm = self._build_model(colors_mode=self._video_mode)
-        with tic("video_render", cuda=True):
-            pkg = render(self._overview, tm, _pipe, _BG)
+        if self._video_mode == "age":
+            pkg = self._render_age(self._overview)
+            if pkg is None:
+                return
+        else:
+            with tic("video_render", cuda=True):
+                pkg = render(self._overview, self._model, _pipe, _BG)
         torchvision.utils.save_image(
             pkg["render"].clamp(0, 1),
             os.path.join(self._video_dir, f"f{self._video_n:06d}.png"))
@@ -459,8 +487,9 @@ class TriangleMapper:
 
     def render_age_view(self, kf, path):
         """Deliverable 4: render the whole map age-colored from kf's viewpoint."""
-        pkg = self._render(kf, colors_mode="age")
-        torchvision.utils.save_image(pkg["render"], path)
+        pkg = self._render_age(make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0]))
+        if pkg is not None:
+            torchvision.utils.save_image(pkg["render"], path)
 
     def dump_views(self, kf, out_dir, patch_debug=None):
         os.makedirs(out_dir, exist_ok=True)
@@ -473,7 +502,9 @@ class TriangleMapper:
         # it duplicated what the render and the seam tile already show.
         tiles = [gt, pkg_rgb["render"].clamp(0, 1)]
         if self.debug:                                     # age view is debug-only
-            tiles.append(self._render(kf, colors_mode="age")["render"].clamp(0, 1))
+            age = self._render_age(make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0]))
+            if age is not None:
+                tiles.append(age["render"].clamp(0, 1))
         if patch_debug is not None:
             tiles.append(patch_debug.to(gt.device))
         while len(tiles) < 4:
@@ -638,8 +669,8 @@ if __name__ == "__main__":
     p.add_argument("--video_fov_scale", type=float, default=2.0,
                    help="divides the focal length; 2.0 is roughly twice the "
                         "field of view")
-    p.add_argument("--video_width", type=int, default=1280)
-    p.add_argument("--video_height", type=int, default=720)
+    p.add_argument("--video_width", type=int, default=1920)
+    p.add_argument("--video_height", type=int, default=1080)
     p.add_argument("--video_fps", type=int, default=30,
                    help="frame rate of the output video")
     p.add_argument("--tail_seconds", type=float, default=5.0,
