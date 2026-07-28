@@ -55,11 +55,18 @@ def default_png_scale(K):
 class GtDepthSource:
     """Maps records to ground-truth depth PNGs in a sibling `*_depth` folder."""
 
-    def __init__(self, depth_dir, png_scale=None, align=True, undistort="auto",
-                 max_depth=50.0):
+    def __init__(self, depth_dir, png_scale=None, align="per_frame",
+                 undistort="auto", max_depth=50.0):
         self.dir = depth_dir
         self.png_scale = png_scale
+        if align is True:
+            align = "per_frame"
+        elif align is False:
+            align = "none"
+        if align not in ("per_frame", "global", "none"):
+            raise ValueError(f"align must be per_frame/global/none, got {align!r}")
         self.align = align
+        self.scale_spread = None
         self.undistort = undistort
         self.max_depth = max_depth
 
@@ -71,7 +78,8 @@ class GtDepthSource:
 
         self._stems = {os.path.splitext(os.path.basename(f))[0]: f
                        for f in self.files}
-        self.strategy = None      # "stem:<pattern>" | "index" | "ordinal"
+        self._assoc = self._load_association()
+        self.strategy = None      # "assoc" | "stem:<pattern>" | "index" | "ordinal"
         self.scale = 1.0          # metres -> record/pose frame
         self._map_corr = None
         self._undistort_maps = None
@@ -87,9 +95,67 @@ class GtDepthSource:
             img = img[..., 0]
         return img.astype(np.float32)
 
+    @staticmethod
+    def _read_tum_index(path):
+        ts, names = [], []
+        with open(path) as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                parts = ln.split()
+                if len(parts) < 2:
+                    continue
+                ts.append(float(parts[0]))
+                names.append(os.path.basename(parts[1]))
+        return np.asarray(ts, np.float64), names
+
+    def _load_association(self):
+        """TUM rgb.txt + depth.txt, the only correct pairing for that dataset.
+
+        The RGB and depth streams are captured at different instants and have
+        different lengths (freiburg1_room: 1362 vs 1360), so pairing by position
+        drifts. `record.index` is a row index into rgb.txt -- see
+        `third_party/nerf-slam/datasets/tum_dataset.py`, which builds its frame
+        list from rgb.txt alone -- so the record's timestamp is rgb_ts[index],
+        and the depth frame is whichever is nearest in time.
+        """
+        for base in (self.dir, os.path.dirname(os.path.normpath(self.dir))):
+            rgb_txt = os.path.join(base, "rgb.txt")
+            dep_txt = os.path.join(base, "depth.txt")
+            if os.path.isfile(rgb_txt) and os.path.isfile(dep_txt):
+                rgb_ts, _ = self._read_tum_index(rgb_txt)
+                dep_ts, dep_names = self._read_tum_index(dep_txt)
+                if len(rgb_ts) and len(dep_ts):
+                    o = np.argsort(dep_ts)
+                    return {"rgb_ts": rgb_ts, "dep_ts": dep_ts[o],
+                            "dep_names": [dep_names[i] for i in o],
+                            "src": base, "max_dt": 0.0}
+        return None
+
+    def _assoc_path(self, record, max_dt=0.05):
+        a = self._assoc
+        k = int(record.index)
+        if a is None or not (0 <= k < len(a["rgb_ts"])):
+            return None
+        t = a["rgb_ts"][k]
+        j = int(np.searchsorted(a["dep_ts"], t))
+        best, bd = None, np.inf
+        for c in (j - 1, j):
+            if 0 <= c < len(a["dep_ts"]):
+                d = abs(a["dep_ts"][c] - t)
+                if d < bd:
+                    best, bd = c, d
+        if best is None or bd > max_dt:
+            return None
+        a["max_dt"] = max(a["max_dt"], bd)
+        return self._stems.get(os.path.splitext(a["dep_names"][best])[0])
+
     def _path_for(self, record, ordinal):
         if self.strategy is None:
             return None
+        if self.strategy == "assoc":
+            return self._assoc_path(record)
         if self.strategy.startswith("stem:"):
             pat = self.strategy[5:]
             return self._stems.get(pat.format(i=int(record.index)))
@@ -128,11 +194,50 @@ class GtDepthSource:
         d[~np.isfinite(d)] = 0.0
         if self.max_depth:
             d[d > self.max_depth] = 0.0
-        return (d / self.scale).astype(np.float32)           # into pose scale
+
+        s = self.scale
+        if self.align == "per_frame":
+            # Monocular scale drifts along the trajectory (measured on
+            # freiburg1_room: 1.73 at the start to 1.45 at the end, correlation
+            # -0.707 with keyframe index), so one global factor cannot hold.
+            # Pose k and the SLAM depth at k come out of the same bundle
+            # adjustment and agree locally, so matching this keyframe's own
+            # factor is what keeps back-projected geometry consistent with its
+            # pose -- while still taking the shape from ground truth.
+            local = self._frame_scale(d, record.depth)
+            if local is not None:
+                s = local
+        return (d / s).astype(np.float32)                    # into pose scale
+
+    def _frame_scale(self, metric, slam_depth, min_px=500):
+        m = ((metric > 0) & (slam_depth > 0) & (slam_depth < self.max_depth)
+             & np.isfinite(slam_depth))
+        if m.sum() < min_px:
+            return None
+        return float(np.median(metric[m] / slam_depth[m]))
 
     # -- calibration -------------------------------------------------------
 
-    def calibrate(self, records, min_corr=0.5):
+    def _score(self, records):
+        """Median correlation of the current mapping against the record depth."""
+        corrs = []
+        for ordinal, rec in enumerate(records):
+            try:
+                g = self.depth_for(rec, ordinal)
+            except Exception:
+                g = None
+            if g is None:
+                continue
+            d = rec.depth
+            m = (g > 0) & (d > 0) & (d < self.max_depth) & np.isfinite(d)
+            if m.sum() < 500:
+                continue
+            corrs.append(np.corrcoef(g[m], d[m])[0, 1])
+        if len(corrs) < max(1, len(records) // 2):
+            return None
+        return float(np.median(corrs))
+
+    def calibrate(self, records, min_corr=0.5, max_scale_spread=0.10):
         """Pick the index->file mapping and the global scale, then verify.
 
         The mapping is chosen by correlating candidate GT frames against the
@@ -151,46 +256,53 @@ class GtDepthSource:
                 f"({'TUM' if _looks_like_tum(K) else 'Replica'}, from intrinsics fx="
                 f"{float(K[0, 0]):.1f})")
 
-        cands = [f"stem:{p}" for p in _STEM_PATTERNS] + ["index", "ordinal"]
-        best, best_corr = None, -np.inf
         saved_scale, self.scale = self.scale, 1.0
-        for strat in cands:
-            self.strategy = strat
-            corrs = []
-            for ordinal, rec in enumerate(records):
-                try:
-                    g = self.depth_for(rec, ordinal)
-                except Exception:
-                    g = None
-                if g is None:
-                    continue
-                d = rec.depth
-                m = (g > 0) & (d > 0) & (d < self.max_depth) & np.isfinite(d)
-                if m.sum() < 500:
-                    continue
-                corrs.append(np.corrcoef(g[m], d[m])[0, 1])
-            if len(corrs) >= max(1, len(records) // 2):
-                c = float(np.median(corrs))
-                if c > best_corr:
+        if self._assoc is not None:
+            # The dataset ships its own pairing. Do not put that in a contest
+            # against positional guesses: consecutive depth frames at 30 Hz are
+            # nearly identical, and against a noisy monocular depth estimate the
+            # correlation ceiling is only ~0.74, so a one-frame offset barely
+            # moves the score. Measured on freiburg1_room with a probe spanning
+            # the sequence, the wrong positional mapping actually scored *higher*
+            # (0.744) than the correct timestamp association (0.728), while the
+            # streams demonstrably diverge for 1014 of 1362 rows.
+            self.strategy = "assoc"
+            best_corr = self._score(records)
+        else:
+            best, best_corr = None, -np.inf
+            for strat in ([f"stem:{p}" for p in _STEM_PATTERNS]
+                          + ["index", "ordinal"]):
+                self.strategy = strat
+                c = self._score(records)
+                if c is not None and c > best_corr:
                     best, best_corr = strat, c
-        self.strategy, self._map_corr = best, best_corr
+            self.strategy = best
+        self._map_corr = best_corr
         self.scale = saved_scale
 
-        if best is None:
+        if self.strategy is None or best_corr is None:
             raise RuntimeError(
                 f"could not match any record to a PNG in {self.dir}. "
                 f"Files look like: {[os.path.basename(f) for f in self.files[:3]]}")
         if best_corr < min_corr:
             raise RuntimeError(
-                f"best index->file mapping ({best}) correlates only "
-                f"{best_corr:.2f} with the record depth, below {min_corr}. The "
-                f"PNGs are probably misaligned with the keyframes. Files look "
-                f"like: {[os.path.basename(f) for f in self.files[:3]]}")
-        self._report.append(f"mapping={best} (depth correlation {best_corr:.3f})")
+                f"mapping {self.strategy} correlates only {best_corr:.2f} with "
+                f"the record depth, below {min_corr}. The PNGs are probably "
+                f"misaligned with the keyframes. Files look like: "
+                f"{[os.path.basename(f) for f in self.files[:3]]}")
+        self._report.append(
+            f"mapping={self.strategy} (depth correlation {best_corr:.3f})")
+        if self.strategy == "assoc":
+            self._report.append(
+                f"  timestamp association from {self._assoc['src']}; "
+                f"worst rgb->depth gap {self._assoc['max_dt'] * 1e3:.1f} ms")
 
         # global scale: monocular SLAM fixes geometry only up to one factor
         self.scale = 1.0
-        if self.align:
+        if self.align != "none":
+            # measure unscaled, or per-frame alignment would divide the very
+            # ratio we are trying to read and always report 1.0
+            align, self.align = self.align, "global"
             ratios = []
             for ordinal, rec in enumerate(records):
                 g = self.depth_for(rec, ordinal)
@@ -201,18 +313,32 @@ class GtDepthSource:
                 if m.sum() < 500:
                     continue
                 ratios.append(float(np.median(g[m] / d[m])))
+            self.align = align
             if not ratios:
                 raise RuntimeError("no overlapping pixels to estimate the scale")
             self.scale = float(np.median(ratios))
             spread = float(np.std(ratios) / max(self.scale, 1e-9))
             self._report.append(
                 f"scale={self.scale:.4f} metres per record unit "
-                f"(spread {spread:.1%} over {len(ratios)} keyframes)")
-            if spread > 0.10:
+                f"(spread {spread:.1%} over {len(ratios)} keyframes), "
+                f"align={self.align}")
+            if self.align == "per_frame":
                 self._report.append(
-                    "  WARNING: scale is not constant across keyframes. Either "
-                    "the mapping is wrong or the trajectory drifts in scale; "
-                    "geometry from different keyframes will not line up.")
+                    "  each keyframe uses its own factor, so trajectory scale "
+                    "drift does not misplace patches; the global figure above "
+                    "is reported for reference only")
+            self.scale_spread = spread
+            if spread > max_scale_spread and self.align != "per_frame":
+                # Spread is a sharper health check than correlation: a correct
+                # pairing yields one global factor, a wrong one yields noise.
+                # On freiburg1_room the correct association gives 2.5% and the
+                # wrong positional mapping 7.5%, while their correlations differ
+                # by less than 0.02.
+                self._report.append(
+                    f"  WARNING: scale varies {spread:.1%} across keyframes, "
+                    f"above {max_scale_spread:.0%}. Either the depth is paired "
+                    f"with the wrong keyframes or the trajectory drifts in "
+                    f"scale; geometry from different keyframes will not line up.")
         return self
 
     def summary(self):

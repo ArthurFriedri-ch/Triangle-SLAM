@@ -131,6 +131,90 @@ def test_wrong_png_scale_is_absorbed_by_alignment():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_timestamp_association_beats_position():
+    """rgb.txt/depth.txt must win even when the streams have different lengths.
+
+    On freiburg1_room rgb.txt has 1362 rows and depth.txt 1360; they stay in
+    step until rgb row 240 and then differ for 1014 of 1362 rows. Pairing by
+    position silently uses the wrong depth frame for most of the sequence.
+    """
+    d = tempfile.mkdtemp()
+    try:
+        n_rgb, dropped = 40, {10, 25}          # depth misses two frames
+        rgb_ts = [1305031910.0 + 0.0333 * i for i in range(n_rgb)]
+        dep_rows, names = [], {}
+        for i in range(n_rgb):
+            if i in dropped:
+                continue
+            t = rgb_ts[i] + 0.006            # depth lags rgb slightly, as in TUM
+            nm = f"{t:.6f}.png"
+            cv2.imwrite(os.path.join(d, nm),
+                        np.clip(_metric_depth(i) * PNG_SCALE_REPLICA,
+                                0, 65535).astype(np.uint16))
+            dep_rows.append(f"{t:.6f} depth/{nm}")
+            names[i] = nm
+        with open(os.path.join(d, "rgb.txt"), "w") as fh:
+            fh.write("# color images\n")
+            for i, t in enumerate(rgb_ts):
+                fh.write(f"{t:.6f} rgb/{t:.6f}.png\n")
+        with open(os.path.join(d, "depth.txt"), "w") as fh:
+            fh.write("# depth maps\n")
+            fh.write("\n".join(dep_rows) + "\n")
+
+        # keyframes past the divergence, where position and time disagree
+        idx = [2, 8, 15, 22, 30, 35, 38]
+        recs = [SimpleNamespace(index=i, depth=_metric_depth(i) / TRUE_SCALE,
+                                intrinsics=K_REPLICA) for i in idx]
+        src = GtDepthSource(d, align="global").calibrate(recs)
+        assert src.strategy == "assoc", src.strategy
+        # the association must land on the frame with the matching content
+        for k, r in enumerate(recs):
+            got = src.depth_for(r, k)
+            want = _metric_depth(r.index) / TRUE_SCALE
+            m = (got > 0) & (want > 0)
+            assert np.abs(got[m] - want[m]).max() < 0.02, \
+                f"index {r.index} paired with the wrong depth frame"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_per_frame_align_absorbs_scale_drift():
+    """Monocular scale drifts along the trajectory; one factor cannot hold.
+
+    Measured on freiburg1_room: 1.73 at the start falling to 1.45 at the end,
+    correlation -0.707 with keyframe index. Global alignment left a worst-case
+    24.3% scale error against the pose frame; per-frame left 0.0%.
+    """
+    d = tempfile.mkdtemp()
+    try:
+        n = 10
+        drifts = np.linspace(1.0, 1.4, n)          # 40% drift over the sequence
+        metrics = [_metric_depth(i) for i in range(n)]
+        for i, m in enumerate(metrics):
+            cv2.imwrite(os.path.join(d, f"depth{i:06d}.png"),
+                        np.clip(m * PNG_SCALE_REPLICA, 0, 65535).astype(np.uint16))
+        recs = [SimpleNamespace(index=i,
+                                depth=metrics[i] / (TRUE_SCALE * drifts[i]),
+                                intrinsics=K_REPLICA)
+                for i in range(n)]
+
+        worst = {}
+        for mode in ("global", "per_frame"):
+            src = GtDepthSource(d, align=mode).calibrate(recs)
+            dev = []
+            for k, r in enumerate(recs):
+                g = src.depth_for(r, k)
+                m = (g > 0) & (r.depth > 0)
+                dev.append(abs(float(np.median(g[m] / r.depth[m])) - 1.0))
+            worst[mode] = max(dev)
+        assert worst["per_frame"] < 0.01, \
+            f"per-frame left {worst['per_frame']:.1%} scale error"
+        assert worst["global"] > 5 * max(worst["per_frame"], 1e-6), \
+            "global alignment should visibly suffer from the drift"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_depth_dir_for():
     d = tempfile.mkdtemp()
     try:

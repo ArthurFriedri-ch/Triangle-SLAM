@@ -1,6 +1,5 @@
 # mapper/harness.py
 import argparse
-import itertools
 import os
 
 import torch
@@ -286,11 +285,13 @@ if __name__ == "__main__":
                    help="override the ground-truth depth folder")
     p.add_argument("--gt_depth_scale", type=float, default=None,
                    help="PNG units per metre (default: 5000 TUM / 6553.5 Replica)")
-    p.add_argument("--gt_depth_no_align", action="store_true",
-                   help="do NOT rescale ground-truth depth into the pose frame. "
-                        "The SLAM is monocular, so its poses carry an arbitrary "
-                        "global scale; without alignment the geometry will not "
-                        "match the camera baselines.")
+    p.add_argument("--gt_depth_align", default="per_frame",
+                   choices=("per_frame", "global", "none"),
+                   help="rescale ground-truth depth into the pose frame. The "
+                        "SLAM is monocular, so its poses carry an arbitrary "
+                        "scale that also drifts along the trajectory; "
+                        "'none' will not match the camera baselines at all and "
+                        "'global' will drift away from them.")
     p.add_argument("--gt_depth_probe", type=int, default=8,
                    help="keyframes used to calibrate the mapping and scale")
     args = p.parse_args()
@@ -302,10 +303,17 @@ if __name__ == "__main__":
             print(f"[gt-depth] no {args.records_dir}_depth folder; "
                   f"using the record's SLAM depth")
         else:
-            probe = list(itertools.islice(
-                source_from_dir(args.records_dir), args.gt_depth_probe))
+            # Spread the probe across the whole sequence. Sampling only the
+            # first N cannot tell apart mappings that agree early and diverge
+            # later: on freiburg1_room the rgb and depth streams stay in step
+            # until rgb row 240, then differ for 1014 of 1362 rows, and the
+            # records run to index 536.
+            paths = slam_interface.list_record_paths(args.records_dir)
+            n = min(args.gt_depth_probe, len(paths))
+            pick = np.linspace(0, len(paths) - 1, n).round().astype(int)
+            probe = [slam_interface.read(paths[i]) for i in sorted(set(pick))]
             gt = GtDepthSource(gt_dir, png_scale=args.gt_depth_scale,
-                               align=not args.gt_depth_no_align).calibrate(probe)
+                               align=args.gt_depth_align).calibrate(probe)
             print(gt.summary())
 
     mapper = TriangleMapper(debug=not args.fast,
