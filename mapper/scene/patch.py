@@ -1,10 +1,25 @@
 import cv2
 import torch
 import numpy as np
+import shapely
 import triangle as tr   # pip install triangle
 import torch.nn.functional as F
-from collections import Counter
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
+from utils.timing import tic, count
+
+# Snap-rounding grid for the seam boolean, in pixels. Two jobs: it makes the
+# overlay deterministic, and it guarantees no sliver thinner than GRID can reach
+# Triangle. A hairline sliver is what makes the quality mesher explode -- at a
+# 0.001 px gap `pq20a1152` emits 2.8M triangles for two rings.
+GRID = 1e-3
+# Match radius when recovering weld ids after the boolean. Must exceed GRID,
+# since set_precision moves surviving vertices by up to half a grid cell.
+ID_TOL = 5e-3
+# Cap on output triangles, as a multiple of the expected count. The tripwire for
+# the sliver blowup above.
+TRI_BLOWUP_FACTOR = 50
 
 
 class Patch:
@@ -14,6 +29,15 @@ class Patch:
         self.colors   = colors      # (V,3) 0..1
         self.faces    = faces       # (F,3) int index triplets
         self.age      = age         # keyframe index at seeding -> for age coloring
+        self._bloops  = None        # cached oriented boundary rings, see boundary_loops
+
+    def boundary_loops(self):
+        """Oriented closed rings of this patch's boundary, as vertex indices."""
+        if self._bloops is None:
+            self._bloops = boundary_loops(self.faces.detach().cpu().numpy(),
+                                          len(self.vertices))
+        return self._bloops
+
 
 def seed_patch(kf, model, mode="cdt", **kw):
     if mode == "grid":
@@ -100,121 +124,174 @@ def seed_patch_grid(kf, mask, step=64, max_depth_jump=0.1, max_cov=5000):
     )
     return patch
 
-def seed_patch_cdt(kf, model=None, max_corners=400, corner_quality=0.01,
+
+def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
+                   max_corners=400, corner_quality=0.01,
                    nms_radius=4, k_harris=0.04, smooth_ksize=5,
                    min_dist=24, cov_max=1e5, debug=True):
     """
     Triangulate the region that is (inside the covariance contour) AND (not
-    already covered by `model` as seen from this camera). The model's projected
-    boundary enters as a hard constraint, so the new patch's edge matches the
-    existing geometry vertex-for-vertex.
+    already covered by `model` as seen from this camera).
 
-    Returns (patch, ids) or (patch, ids, tile). `ids[k] >= 0` means vertex k
-    is model vertex ids[k] — that is the welding table.
+    The seam comes from exact polygon arithmetic -- one boolean,
+    `cov_region - union(projected model outlines)` -- so the new patch's edge
+    matches the existing geometry vertex-for-vertex. Every inside/outside
+    *classification* goes through a mask rasterised from those same polygons,
+    which is where the old code spent its time doing exact geometry it did not
+    need.
+
+    `model_loops` are the model's cached oriented boundary rings (vertex index
+    arrays); derived from the face array if not supplied. `rendered_depth` is
+    the model's depth as seen from this camera; when given, model regions that
+    sit *behind* what this keyframe measures are treated as not-yet-covered.
+
+    Returns (patch, tile, ids); `tile` is None unless `debug`, and all three are
+    None if nothing could be seeded. `ids[k] >= 0` means vertex k is model
+    vertex ids[k] -- that is the welding table.
     """
     device = kf.depth.device
     H, W = kf.depth.shape
     depth = kf.depth
 
     # --- 1. covariance loops (vector) ------------------------------------
-    res = _cov_loops(kf.cov, cov_max=cov_max)
+    with tic("cov_loops"):
+        res = _cov_loops(kf.cov, cov_max=cov_max)
     if res is None:
-        return (None, None, None) if debug else (None, None)
+        return None, None, None
     loops, is_hole, _markers, region = res      # markers unused now
 
-    # --- 2. model boundary, projected ------------------------------------
-    if model is not None and len(model._triangle_indices):
-        P_m, S_m, ids_m, tri_uv = project_boundary(model, kf)
-    else:
-        P_m = np.empty((0, 2))
-        S_m = np.empty((0, 2), np.int64)
-        ids_m = np.empty(0, np.int64)
-        tri_uv = np.empty((0, 3, 2))
+    # --- 2. model boundary rings, projected -------------------------------
+    with tic("project_loops"):
+        rings_uv, rings_id = [], []
+        if model is not None and len(model.vertices):
+            if model_loops is None:
+                model_loops = boundary_loops(
+                    model._triangle_indices.detach().cpu().numpy(),
+                    len(model.vertices))
+            rings_uv, rings_id = project_loops(model_loops, model.vertices, kf,
+                                               shape=(H, W))
+    count("n_model_rings", len(rings_uv))
 
-    # --- 3. merge into one segment soup ----------------------------------
-    P, S, ids, off = [P_m], [S_m], [ids_m], len(P_m)
-    for xy in loops:
-        k = len(xy)
-        idx = np.arange(off, off + k)
-        P.append(xy)
-        S.append(np.stack([idx, np.roll(idx, -1)], 1))
-        ids.append(-np.ones(k, np.int64))
-        off += k
-    P = np.concatenate(P).astype(np.float64)
-    S = np.concatenate(S).astype(np.int64)
-    ids = np.concatenate(ids)
+    # --- 3. one boolean: cov region minus what the model already covers ----
+    with tic("seam_boolean"):
+        occluders = None
+        if rendered_depth is not None and len(rings_uv):
+            occluders = _revealed_polygons(rendered_depth, depth, (H, W))
+        rings, ring_ids, holes_xy, stats = seam_boolean(
+            loops, is_hole, rings_uv, rings_id, revealed=occluders)
+    for k, v in stats.items():
+        count(k, v)
+    if not rings:
+        return None, None, None
 
-    P, S, ids, _pad = _pad_ids(P, S, ids)          # see note below
-    P, S = split_crossings(P, S)
-    P, S = split_at_vertices(P, S) # NEW: resolve T-junctions
-    ids = np.concatenate([ids, -np.ones(len(P) - len(ids), np.int64)])
-
-    P, S, ids = _densify(P, S, ids, max_len=min_dist * 1.5)
-    P, S, ids = _dedupe(P, S, ids)
+    # --- 4. PSLG: densify each ring; no crossings are possible ------------
+    with tic("pslg"):
+        P, S, ids, off = [], [], [], 0
+        for xy, vid in zip(rings, ring_ids):
+            xy2, id2 = _densify_ring(xy, vid, min_dist * 1.5)
+            k = len(xy2)
+            idx = np.arange(off, off + k)
+            P.append(xy2)
+            ids.append(id2)
+            S.append(np.stack([idx, np.roll(idx, -1)], 1))
+            off += k
+        P = np.concatenate(P).astype(np.float64)
+        S = np.concatenate(S).astype(np.int64)
+        ids = np.concatenate(ids).astype(np.int64)
+        P, S, ids = _dedupe(P, S, ids)
     if len(S) < 3:
-        return (None, None, None) if debug else (None, None)
+        return None, None, None
 
-    # --- 4. interior seeds -----------------------------------------------
-    step = max(int(min_dist), 1)
-    gy, gx = np.mgrid[step // 2:H:step, step // 2:W:step]
-    cand = np.stack([gx.ravel(), gy.ravel()], 1).astype(np.float64)
+    # --- 5. masks: every classification below is an O(1) lookup ------------
+    with tic("masks"):
+        keep_mask = _mask_from_rings(rings, (H, W))
+        # distance to the nearest non-kept pixel == clearance from the seam
+        clearance = cv2.distanceTransform(keep_mask, cv2.DIST_L2, 3)
 
-    ok = _inside_loops(cand, loops, is_hole) & ~_covered(cand, tri_uv)
-    cand = cand[ok]
-    cand = cand[_seg_clearance(cand, P, S) > min_dist]
+    def _ok(pts):
+        x = np.round(pts[:, 0]).astype(np.int64).clip(0, W - 1)
+        y = np.round(pts[:, 1]).astype(np.int64).clip(0, H - 1)
+        return (keep_mask[y, x] > 0) & (clearance[y, x] > min_dist)
 
-    corners = _harris_seeds(depth, region, loops, is_hole, tri_uv, P, S,
-                            max_corners, corner_quality, nms_radius,
-                            k_harris, smooth_ksize, min_dist, device)
+    # --- 6. interior seeds -----------------------------------------------
+    with tic("seeds"):
+        step = max(int(min_dist), 1)
+        gy, gx = np.mgrid[step // 2:H:step, step // 2:W:step]
+        cand = np.stack([gx.ravel(), gy.ravel()], 1).astype(np.float64)
+        cand = cand[_ok(cand)]
 
-    seeds = [p for p in (corners, cand) if len(p)]
-    seeds = np.concatenate(seeds, 0) if seeds else np.empty((0, 2))
-    if len(seeds):
-        seeds = seeds[_thin(seeds, min_dist * 0.6)]
+        corners = _harris_seeds(depth, region, _ok, max_corners, corner_quality,
+                                nms_radius, k_harris, smooth_ksize, device)
 
-    # --- 5. triangulate: constraints only, no hole markers ---------------
+        seeds = [p for p in (corners, cand) if len(p)]
+        seeds = np.concatenate(seeds, 0) if seeds else np.empty((0, 2))
+        if len(seeds):
+            seeds = seeds[_thin(seeds, min_dist * 0.6)]
+    count("n_seeds", len(seeds))
+
+    # --- 7. triangulate the kept region only ------------------------------
     nP = len(P)
     vertices = np.vstack([P, seeds]) if len(seeds) else P
     tri_in = {"vertices": np.ascontiguousarray(vertices, np.float64),
               "segments": np.ascontiguousarray(S, np.int32)}
+    if len(holes_xy):
+        tri_in["holes"] = np.ascontiguousarray(holes_xy, np.float64)
 
     assert S.max() < len(vertices)
-    assert len(np.unique(vertices.round(6), axis=0)) == len(vertices)
 
-    # p = _validate_pslg(P, S)
-    # print({k: (len(v) if hasattr(v, "__len__") else v) for k, v in p.items()})
-    out = tr.triangulate(tri_in, "pq20a%dY" % (min_dist ** 2 * 2))
+    max_area = min_dist ** 2 * 2
+    with tic("triangulate"):
+        out = tr.triangulate(tri_in, "pq20a%dY" % max_area)
     V = out["vertices"]
-    assert np.allclose(V[:nP], P), "Y inserted boundary points; ids misaligned"
+    F_all = out["triangles"].astype(np.int64)
+    count("n_tri_out", len(F_all))
+    # Triangle appends Steiner points, so the input prefix survives in order.
+    # This is what keeps `ids` aligned; it is not documented, so assert it.
+    assert np.allclose(V[:nP], P), "Triangle reordered the input vertices; ids misaligned"
+
+    expected = max(int(keep_mask.sum() / max_area), 1)
+    if len(F_all) > TRI_BLOWUP_FACTOR * expected:
+        # A sliver survived the boolean. Bail loudly rather than march into the
+        # rest of the pipeline with a multi-million-triangle mesh.
+        print(f"[seed_patch] triangulation blew up: {len(F_all)} tris vs "
+              f"~{expected} expected; {len(P)} PSLG pts, {len(rings)} rings. "
+              f"Skipping keyframe {kf.index}.")
+        return None, None, None
 
     ids_full = np.concatenate([ids, -np.ones(len(V) - nP, np.int64)])
-
-    # --- 6. classify: inside covariance, outside the model ---------------
-    F_all = out["triangles"].astype(np.int64)
-    cen = V[F_all].mean(1)
-    keep = _inside_loops(cen, loops, is_hole) & ~_covered(cen, tri_uv)
-    F_all = F_all[keep]
     if len(F_all) == 0:
-        return (None, None, None) if debug else (None, None)
+        return None, None, None
 
-    # --- 7. compact ------------------------------------------------------
+    # --- 8. compact ------------------------------------------------------
     used = np.unique(F_all)
     remap = -np.ones(len(V), np.int64)
     remap[used] = np.arange(len(used))
     faces_np = remap[F_all]
     V = V[used]
     ids_full = ids_full[used]
+    count("n_ids_ge0", int((ids_full >= 0).sum()))
 
-    # --- 8. back-project -------------------------------------------------
-    verts2d = torch.from_numpy(V).float().to(device)
-    u = verts2d[:, 0].round().long().clamp(0, W - 1)
-    v = verts2d[:, 1].round().long().clamp(0, H - 1)
-    z = depth[v, u]
-    fx, fy, cx, cy = kf.K[0, 0], kf.K[1, 1], kf.K[0, 2], kf.K[1, 2]
-    cam = torch.stack([(verts2d[:, 0] - cx) * z / fx,
-                       (verts2d[:, 1] - cy) * z / fy,
-                       z, torch.ones_like(z)], -1)
-    world = torch.einsum("ij,nj->ni", kf.c2w, cam)[:, :3]
+    # --- 9. back-project -------------------------------------------------
+    with tic("backproject"):
+        verts2d = torch.from_numpy(V).float().to(device)
+        u = verts2d[:, 0].round().long().clamp(0, W - 1)
+        v = verts2d[:, 1].round().long().clamp(0, H - 1)
+        z = depth[v, u]
+        fx, fy, cx, cy = kf.K[0, 0], kf.K[1, 1], kf.K[0, 2], kf.K[1, 2]
+        cam = torch.stack([(verts2d[:, 0] - cx) * z / fx,
+                           (verts2d[:, 1] - cy) * z / fy,
+                           z, torch.ones_like(z)], -1)
+        world = torch.einsum("ij,nj->ni", kf.c2w, cam)[:, :3]
+
+        # A weld vertex IS the model vertex. Re-measuring it from this
+        # keyframe's depth puts it somewhere slightly different, which opens a
+        # 3-D crack and -- because both copies then live in the model and
+        # project a fraction of a pixel apart -- manufactures exactly the
+        # hairline slivers that make the mesher explode next keyframe.
+        m = ids_full >= 0
+        if m.any() and model is not None:
+            src = torch.from_numpy(ids_full[m]).to(device)
+            world[m] = model.vertices.detach()[src].to(world.dtype)
 
     if not (z > 0).all():
         print(f"[seed_patch] {(z <= 0).sum().item()} vertices with zero depth")
@@ -224,20 +301,42 @@ def seed_patch_cdt(kf, model=None, max_corners=400, corner_quality=0.01,
                   colors=kf.rgb[v, u], age=kf.index)
 
     if not debug:
-        return patch, ids_full
-    tile = debug_render_weld(kf.cov > cov_max, loops, is_hole, tri_uv,
-                            V, faces_np, ids_full, seeds)
+        return patch, None, ids_full
+    with tic("debug_render"):
+        tile = debug_render_weld(kf.cov > cov_max, loops, is_hole, rings,
+                                 V, faces_np, ids_full, seeds)
     return patch, tile, ids_full
 
+
 def _thin(pts, r):
-    """Greedy: keep a point only if it's > r from all previously kept ones."""
+    """Keep a point only if it is > r from every previously kept one.
+
+    Same semantics as the old O(n^2) version, but bucketed: with cells of side
+    r, a cell holds at most a handful of mutually-separated points, so the
+    neighbourhood scan is O(1) per point.
+    """
     keep = np.zeros(len(pts), bool)
-    kept = []
-    for i, p in enumerate(pts):
-        if not kept or np.min(np.linalg.norm(np.array(kept) - p, axis=1)) > r:
+    cells = {}
+    r2 = r * r
+    inv = 1.0 / r
+    for i, (x, y) in enumerate(pts):
+        cx, cy = int(np.floor(x * inv)), int(np.floor(y * inv))
+        hit = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for px, py in cells.get((cx + dx, cy + dy), ()):
+                    if (px - x) ** 2 + (py - y) ** 2 <= r2:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        if not hit:
             keep[i] = True
-            kept.append(p)
+            cells.setdefault((cx, cy), []).append((x, y))
     return keep
+
 
 def _rasterize(loops, is_hole, shape):
     """Region enclosed by the outer loop minus the hole loops."""
@@ -248,6 +347,14 @@ def _rasterize(loops, is_hole, shape):
     for xy, h in zip(loops, is_hole):
         if h:
             cv2.fillPoly(reg, [np.round(xy).astype(np.int32)], 0)
+    return reg
+
+
+def _mask_from_rings(rings, shape):
+    """Rasterise boolean-output rings. One call, even-odd fill handles holes."""
+    reg = np.zeros(shape, np.uint8)
+    if rings:
+        cv2.fillPoly(reg, [np.round(r).astype(np.int32) for r in rings], 1)
     return reg
 
 
@@ -313,6 +420,7 @@ def _cov_loops(cov, cov_max=1e5, margin=2, smooth=5, close_r=3,
                                 if markers else None), region
     return None
 
+
 def _resample_smooth(cnt, n_pts, smooth):
     cnt = cnt.reshape(-1, 2).astype(np.float64)
     if len(cnt) < 8:
@@ -329,171 +437,320 @@ def _resample_smooth(cnt, n_pts, smooth):
                        for i in range(2)], 1)
     return xy
 
-def boundary_edges(faces):
-    f = np.asarray(faces)
-    e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], 0)
-    e = np.sort(e, 1)
-    cnt = Counter(map(tuple, e))
-    return np.array([k for k, v in cnt.items() if v == 1], np.int64)
 
-def project_boundary(model, kf, near=1e-3):
-    """-> pts (P,2), segs (S,2) int, ids (P,) model vertex index or -1,
-          uv_all (N,2), tri_uv for the coverage test."""
+# --------------------------------------------------------------------------
+# mesh boundary -> oriented rings
+# --------------------------------------------------------------------------
+
+def boundary_halfedges(faces):
+    """Directed half-edges used by exactly one face, i.e. the mesh boundary."""
+    f = np.asarray(faces)
+    if len(f) == 0:
+        return np.empty((0, 2), np.int64)
+    de = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], 0)
+    _, inv, cnt = np.unique(np.sort(de, 1), axis=0,
+                            return_inverse=True, return_counts=True)
+    return de[cnt[inv.ravel()] == 1].astype(np.int64)
+
+
+def boundary_loops(faces, n_vertices):
+    """Chain the boundary half-edges into oriented closed rings.
+
+    Returns a list of vertex-index arrays, each a ring with no repeated last
+    point. Rings passing through a pinch vertex -- one with several outgoing
+    boundary half-edges, which happens whenever the kept region narrows to a
+    point -- are resolved by walking the half-edge fan, because the naive
+    next-pointer assignment silently fuses two rings into a garbage one.
+    """
+    de = boundary_halfedges(faces)
+    if len(de) == 0:
+        return []
+    src, dst = de[:, 0], de[:, 1]
+    fan = np.bincount(src, minlength=n_vertices)
+    count("n_pinch_vertices", int((fan > 1).sum()))
+
+    # Multiple boundary half-edges leaving a vertex: keep them all and pick the
+    # one that continues the ring we arrived on.
+    outgoing = {}
+    for a, b in de:
+        outgoing.setdefault(int(a), []).append(int(b))
+
+    used = set()
+    loops = []
+    for a0, b0 in de:
+        a0, b0 = int(a0), int(b0)
+        if (a0, b0) in used:
+            continue
+        ring = []
+        a, b = a0, b0
+        while True:
+            used.add((a, b))
+            ring.append(a)
+            nxt = [c for c in outgoing.get(b, []) if (b, c) not in used]
+            if not nxt:
+                break
+            a, b = b, nxt[0]
+            if (a, b) == (a0, b0):
+                break
+        if len(ring) >= 3:
+            loops.append(np.asarray(ring, np.int64))
+    return loops
+
+
+# --------------------------------------------------------------------------
+# projection
+# --------------------------------------------------------------------------
+
+def _clip_plane(C, ids, value, axis, keep_greater):
+    """Sutherland-Hodgman against one axis-aligned half-space, vectorised.
+
+    C is (L,k) of whatever is being carried (3-D camera points, or 2-D uv).
+    Vertices introduced at a crossing get id -1: they are not model vertices.
+    """
+    v = C[:, axis]
+    keep = (v > value) if keep_greater else (v < value)
+    if keep.all():
+        return C, ids
+    if not keep.any():
+        return C[:0], ids[:0]
+    nxt = np.roll(np.arange(len(C)), -1)
+    denom = C[nxt, axis] - v
+    denom = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
+    t = (value - v) / denom
+    X = C + t[:, None] * (C[nxt] - C)
+
+    n = len(C)
+    out = np.empty((2 * n, C.shape[1]), np.float64)
+    oid = np.empty(2 * n, np.int64)
+    sel = np.empty(2 * n, bool)
+    out[0::2], out[1::2] = C, X
+    oid[0::2], oid[1::2] = ids, -1
+    sel[0::2], sel[1::2] = keep, keep != keep[nxt]
+    return out[sel], oid[sel]
+
+
+def project_loops(loops, verts_world, kf, near=1e-3, shape=None, snap=GRID):
+    """Project 3-D boundary rings into kf's image.
+
+    Returns (uv_rings, id_rings). One matmul for the whole model, a vectorised
+    near-plane clip per ring, whole-ring frustum culling, and a clip to a
+    generous box -- as z approaches the near plane uv blows up to +-1e6 px,
+    which wrecks the relative epsilons of every downstream predicate.
+    """
     w2c = torch.inverse(kf.c2w)
-    cam = (w2c[:3, :3] @ model.vertices.T).T + w2c[:3, 3]
+    cam = (w2c[:3, :3] @ verts_world.detach().T).T + w2c[:3, 3]
     cam = cam.detach().cpu().numpy().astype(np.float64)
     K = kf.K.detach().cpu().numpy()
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
 
-    def proj(c):
-        return np.stack([c[:, 0] * fx / c[:, 2] + cx,
-                         c[:, 1] * fy / c[:, 2] + cy], 1)
+    H, W = shape if shape is not None else (int(2 * cy), int(2 * cx))
+    box = (-W, -H, 2 * W, 2 * H)
 
-    be = boundary_edges(model._triangle_indices.cpu().numpy())
-    za, zb = cam[be[:, 0], 2], cam[be[:, 1], 2]
-
-    pts, ids, segs = [], [], []
-    index = {}
-
-    def add(xyz, vid):
-        if vid >= 0 and vid in index:
-            return index[vid]
-        pts.append(proj(xyz[None])[0])
-        ids.append(vid)
-        if vid >= 0:
-            index[vid] = len(pts) - 1
-        return len(pts) - 1
-
-    for (i, j), zi, zj in zip(be, za, zb):
-        if zi <= near and zj <= near:
+    uv_rings, id_rings = [], []
+    for ring in loops:
+        C = cam[ring]
+        if C[:, 2].max() <= near:                     # entirely behind
             continue
-        if zi > near and zj > near:
-            segs.append((add(cam[i], int(i)), add(cam[j], int(j))))
+        ids = np.asarray(ring, np.int64)
+        C, ids = _clip_plane(C, ids, near, 2, True)
+        if len(C) < 3:
             continue
-        # one endpoint behind: clip to z = near
-        (k, zk), (l, zl) = ((i, zi), (j, zj)) if zi > near else ((j, zj), (i, zi))
-        t = (near - zk) / (zl - zk)
-        mid = cam[k] + t * (cam[l] - cam[k])
-        segs.append((add(cam[k], int(k)), add(mid, -1)))
-
-    # projected triangles, for coverage classification later
-    infront = (cam[model._triangle_indices.cpu().numpy(), 2] > near).all(1)
-    tri_uv = proj(cam)[model._triangle_indices.cpu().numpy()[infront]]
-
-    return (np.array(pts), np.array(segs, np.int64),
-            np.array(ids, np.int64), tri_uv)
-
-def split_crossings(P, S, tol=1e-7):
-    P, S = P.copy(), S.copy()
-    A, B = P[S[:, 0]], P[S[:, 1]]
-    cuts = [[] for _ in range(len(S))]
-    new_pts = []
-
-    for i in range(len(S)):
-        a, b = A[i], B[i]
-        r = b - a
-        j = np.arange(i + 1, len(S))
-        if not len(j):
-            break
-        c, s = A[j], B[j] - A[j]
-        denom = r[0] * s[:, 1] - r[1] * s[:, 0]
-        ok = np.abs(denom) > tol
-        d = c - a
-        t = np.where(ok, (d[:, 0] * s[:, 1] - d[:, 1] * s[:, 0]) / np.where(ok, denom, 1), -1)
-        u = np.where(ok, (d[:, 0] * r[1] - d[:, 1] * r[0]) / np.where(ok, -denom, 1), -1)
-        hit = ok & (t > tol) & (t < 1 - tol) & (u > tol) & (u < 1 - tol)
-        for jj, tt, uu in zip(j[hit], t[hit], u[hit]):
-            k = len(P) + len(new_pts)
-            new_pts.append(a + tt * r)
-            cuts[i].append((tt, k))
-            cuts[jj].append((uu, k))
-
-    if new_pts:
-        P = np.vstack([P, np.array(new_pts)])
-
-    out = []
-    for i, cl in enumerate(cuts):
-        if not cl:
-            out.append(S[i])
+        uv = np.stack([C[:, 0] * fx / C[:, 2] + cx,
+                       C[:, 1] * fy / C[:, 2] + cy], 1)
+        if uv[:, 0].max() < box[0] or uv[:, 0].min() > box[2] or \
+           uv[:, 1].max() < box[1] or uv[:, 1].min() > box[3]:
+            continue                                   # misses the image
+        for axis, val, greater in ((0, box[0], True), (0, box[2], False),
+                                   (1, box[1], True), (1, box[3], False)):
+            if len(uv) < 3:
+                break
+            uv, ids = _clip_plane(uv, ids, val, axis, greater)
+        if len(uv) < 3:
             continue
-        chain = [S[i, 0]] + [k for _, k in sorted(cl)] + [S[i, 1]]
-        out += [(chain[m], chain[m + 1]) for m in range(len(chain) - 1)]
-    return P, np.array(out, np.int64)
-
-def _pip(pts, poly):
-    """Vectorised even-odd point-in-polygon. pts (N,2), poly (M,2) -> (N,) bool"""
-    y = pts[:, 1]
-    x1, y1 = poly[:, 0], poly[:, 1]
-    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
-    dy = np.where(y2 != y1, y2 - y1, 1.0)
-    straddle = (y1 > y[:, None]) != (y2 > y[:, None])
-    xint = x1 + (y[:, None] - y1) * (x2 - x1) / dy
-    return (straddle & (pts[:, 0:1] < xint)).sum(1) % 2 == 1
-
-
-def _inside_loops(pts, loops, is_hole):
-    """Inside the outer loops, outside every hole loop."""
-    inside = np.zeros(len(pts), bool)
-    for xy, h in zip(loops, is_hole):
-        if not h:
-            inside |= _pip(pts, xy)
-    for xy, h in zip(loops, is_hole):
-        if h:
-            inside &= ~_pip(pts, xy)
-    return inside
-
-
-def _covered(pts, tri_uv, chunk=4096):
-    """Point inside any projected model triangle (either winding)."""
-    if len(tri_uv) == 0:
-        return np.zeros(len(pts), bool)
-    a, b, c = tri_uv[:, 0], tri_uv[:, 1], tri_uv[:, 2]
-    e1, e2, e3 = b - a, c - b, a - c
-    hit = np.zeros(len(pts), bool)
-    for i in range(0, len(pts), chunk):
-        p = pts[i:i + chunk][:, None, :]
-        d1 = e1[:, 0] * (p[..., 1] - a[:, 1]) - e1[:, 1] * (p[..., 0] - a[:, 0])
-        d2 = e2[:, 0] * (p[..., 1] - b[:, 1]) - e2[:, 1] * (p[..., 0] - b[:, 0])
-        d3 = e3[:, 0] * (p[..., 1] - c[:, 1]) - e3[:, 1] * (p[..., 0] - c[:, 0])
-        hit[i:i + chunk] = (((d1 >= 0) & (d2 >= 0) & (d3 >= 0)) |
-                            ((d1 <= 0) & (d2 <= 0) & (d3 <= 0))).any(1)
-    return hit
-
-
-def _seg_clearance(pts, P, S, chunk=2048):
-    """Min distance from each point to any segment. pts (N,2) -> (N,)"""
-    A, B = P[S[:, 0]], P[S[:, 1]]
-    AB = B - A
-    L2 = (AB ** 2).sum(1)
-    L2 = np.where(L2 > 1e-12, L2, 1.0)
-    out = np.empty(len(pts))
-    for i in range(0, len(pts), chunk):
-        p = pts[i:i + chunk][:, None, :]
-        t = (((p - A) * AB).sum(-1) / L2).clip(0.0, 1.0)
-        proj = A + t[..., None] * AB
-        out[i:i + chunk] = np.linalg.norm(p - proj, axis=-1).min(1)
-    return out
-
-
-def _densify(P, S, ids, max_len):
-    """Split segments longer than max_len; inserted points get id -1."""
-    P = list(P)
-    ids = list(ids)
-    out = []
-    for i, j in S:
-        a, b = np.asarray(P[i], float), np.asarray(P[j], float)
-        n = int(np.linalg.norm(b - a) // max_len)
-        if n < 1:
-            out.append((i, j))
+        uv = np.round(uv / snap) * snap                # onto the boolean's grid
+        keep = np.r_[True, (np.diff(uv, axis=0) != 0).any(1)]
+        uv, ids = uv[keep], ids[keep]
+        if len(uv) >= 3 and (uv[0] == uv[-1]).all():
+            uv, ids = uv[:-1], ids[:-1]
+        if len(uv) < 3:
             continue
-        chain = [i]
-        for k in range(1, n + 1):
-            P.append(a + (k / (n + 1)) * (b - a))
-            ids.append(-1)
-            chain.append(len(P) - 1)
-        chain.append(j)
-        out += [(chain[m], chain[m + 1]) for m in range(len(chain) - 1)]
-    return np.array(P), np.array(out, np.int64), np.array(ids, np.int64)
+        uv_rings.append(uv)
+        id_rings.append(ids)
+    return uv_rings, id_rings
+
+
+# --------------------------------------------------------------------------
+# the seam boolean
+# --------------------------------------------------------------------------
+
+def _as_polygons(g):
+    if g is None or g.is_empty:
+        return []
+    t = g.geom_type
+    if t == "Polygon":
+        return [g]
+    if t in ("MultiPolygon", "GeometryCollection"):
+        return [p for gg in g.geoms for p in _as_polygons(gg)]
+    return []
+
+
+def _poly(xy):
+    """Polygon from a ring, repairing self-intersections from silhouette folds."""
+    if len(xy) < 3:
+        return None
+    p = Polygon(xy)
+    if p.is_valid:
+        return p
+    ps = _as_polygons(shapely.make_valid(p))
+    if not ps:
+        return None
+    return ps[0] if len(ps) == 1 else unary_union(ps)
+
+
+def _id_lookup(query, key_xy, key_ids, tol=ID_TOL):
+    """Nearest model vertex within `tol`, vectorised via a bucketed hash.
+
+    Returns (ids, n_hit, n_collision). A collision is two *distinct* model
+    vertices landing in the same bucket -- which is the norm, not an edge case,
+    because two patches that already share a seam have two ids at one point.
+    """
+    if len(query) == 0 or len(key_xy) == 0:
+        return np.full(len(query), -1, np.int64), 0, 0
+    cell = tol
+    kq = np.floor(key_xy / cell).astype(np.int64)
+    key = (kq[:, 0] << 32) ^ (kq[:, 1] & 0xffffffff)
+    o = np.argsort(key, kind="stable")
+    key_s, k_s, id_s = key[o], key_xy[o], key_ids[o]
+
+    dup = int((np.diff(key_s) == 0).sum())
+
+    out = np.full(len(query), -1, np.int64)
+    best = np.full(len(query), np.inf)
+    qq = np.floor(query / cell).astype(np.int64)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            kk = ((qq[:, 0] + dx) << 32) ^ ((qq[:, 1] + dy) & 0xffffffff)
+            pos = np.searchsorted(key_s, kk).clip(0, len(key_s) - 1)
+            hit = key_s[pos] == kk
+            d = np.linalg.norm(query - k_s[pos], axis=1)
+            take = hit & (d < tol) & (d < best)
+            out[take] = id_s[pos][take]
+            best[take] = d[take]
+    return out, int((out >= 0).sum()), dup
+
+
+def _revealed_polygons(rendered_depth, kf_depth, shape, tol=0.05,
+                       min_area=64, open_r=2):
+    """Where the model sits *behind* what this keyframe measures.
+
+    Those pixels show a surface in front of the model that has never been
+    seeded, so they must not count as covered. This is the only occlusion case
+    that is unambiguous: the reverse (model in front of the measurement) means
+    one of the two is wrong, and guessing there would cause more harm.
+
+    Pixel-accurate by construction -- but the seam it produces separates new
+    geometry from new geometry, with no model vertex to weld to, so exactness
+    is not required here the way it is on the mesh boundary.
+    """
+    rd = rendered_depth.detach().cpu().numpy() if torch.is_tensor(rendered_depth) \
+        else np.asarray(rendered_depth)
+    kd = kf_depth.detach().cpu().numpy() if torch.is_tensor(kf_depth) \
+        else np.asarray(kf_depth)
+    if rd.shape != shape:
+        return None
+    mask = ((rd > 0) & (kd > 0) & (rd > kd + tol)).astype(np.uint8)
+    if not mask.any():
+        return None
+    if open_r:
+        k = np.ones((2 * open_r + 1,) * 2, np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None:
+        return None
+    polys = []
+    for c, h in zip(cnts, hier[0]):
+        if h[3] != -1 or len(c) < 3:
+            continue
+        p = _poly(c.reshape(-1, 2).astype(np.float64))
+        if p is not None and p.area >= min_area:
+            polys.append(p)
+    return unary_union(polys) if polys else None
+
+
+def seam_boolean(cov_loops, cov_is_hole, model_uv, model_ids,
+                 revealed=None, grid=GRID, tol=ID_TOL, min_ring_area=1e-3):
+    """cov_region - union(projected model rings), as simple tagged rings.
+
+    Returns (rings, ring_ids, holes_xy, stats). The rings are simple, disjoint
+    and correctly nested by construction, so the PSLG built from them has no
+    crossings and no T-junctions -- which is what lets the whole segment-soup
+    cleanup stage disappear.
+    """
+    stats = {}
+    outer = [p for p in (_poly(xy) for xy, h in zip(cov_loops, cov_is_hole)
+                         if not h) if p is not None]
+    if not outer:
+        return [], [], np.empty((0, 2)), stats
+    cov = unary_union(outer)
+    holes = [p for p in (_poly(xy) for xy, h in zip(cov_loops, cov_is_hole)
+                         if h) if p is not None]
+    if holes:
+        cov = cov.difference(unary_union(holes))
+
+    keep = cov
+    key_xy = np.empty((0, 2))
+    key_ids = np.empty(0, np.int64)
+    if model_uv:
+        mdl_polys = [p for p in (_poly(xy) for xy in model_uv) if p is not None]
+        if mdl_polys:
+            mdl = unary_union(mdl_polys)
+            if revealed is not None and not revealed.is_empty:
+                # a model region the camera sees past is not covered
+                mdl = mdl.difference(revealed)
+            keep = shapely.set_precision(cov, grid).difference(
+                shapely.set_precision(mdl, grid))
+        key_xy = np.concatenate(model_uv) if model_uv else key_xy
+        key_ids = np.concatenate(model_ids) if model_ids else key_ids
+
+    keep = shapely.set_precision(keep, grid)
+    if not keep.is_valid:
+        keep = shapely.make_valid(keep)
+
+    rings, ring_ids, holes_xy = [], [], []
+    n_pts = 0
+    for g in _as_polygons(keep):
+        if g.area < min_ring_area:
+            continue
+        for i, r in enumerate([g.exterior, *g.interiors]):
+            xy = np.asarray(r.coords)[:-1]          # drop the repeated close
+            if len(xy) < 3 or abs(Polygon(xy).area) < min_ring_area:
+                continue
+            rings.append(xy)
+            n_pts += len(xy)
+            if i > 0:
+                holes_xy.append(list(Polygon(xy).representative_point().coords)[0])
+
+    if rings:
+        q = np.concatenate(rings)
+        ids, n_hit, n_dup = _id_lookup(q, key_xy, key_ids, tol)
+        cuts = np.cumsum([len(r) for r in rings])[:-1]
+        ring_ids = np.split(ids, cuts) if len(cuts) else [ids]
+        stats.update(n_seam_pts=n_pts, n_ids_recovered=n_hit,
+                     n_id_bucket_collisions=n_dup, n_model_pts=len(key_xy))
+    stats["n_rings"] = len(rings)
+    return rings, ring_ids, np.array(holes_xy, np.float64).reshape(-1, 2), stats
+
+
+def _densify_ring(xy, ids, max_len):
+    """Split ring edges longer than max_len. Original vertices survive exactly."""
+    d = np.linalg.norm(np.diff(xy, axis=0, append=xy[:1]), axis=1)
+    n = np.maximum(1, np.ceil(d / max_len).astype(np.int64))
+    idx = np.repeat(np.arange(len(xy)), n)
+    k = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+    t = (k / np.repeat(n, n))[:, None]
+    nxt = np.roll(xy, -1, 0)
+    # t == 0 reproduces xy[idx] bit-exactly, so ids and positions both survive
+    return xy[idx] * (1.0 - t) + nxt[idx] * t, np.where(k == 0, ids[idx], -1)
 
 
 def _dedupe(P, S, ids, grid=1e-4):
@@ -508,19 +765,14 @@ def _dedupe(P, S, ids, grid=1e-4):
                               return_inverse=True)
     P2, ids2 = Pp[first], idsp[first]
 
-    S2 = inv[back[S]]
+    S2 = inv.ravel()[back[S]]
     S2 = S2[S2[:, 0] != S2[:, 1]]
     S2 = np.unique(np.sort(S2, 1), axis=0)
     return P2, S2, ids2
 
-def _pad_ids(P, S, ids):
-    if len(ids) < len(P):
-        ids = np.concatenate([ids, -np.ones(len(P) - len(ids), np.int64)])
-    return P, S, ids, len(P)
 
-def _harris_seeds(depth, region, loops, is_hole, tri_uv, P, S, max_corners,
-                  corner_quality, nms_radius, k_harris, smooth_ksize,
-                  min_dist, device):
+def _harris_seeds(depth, region, ok_fn, max_corners, corner_quality,
+                  nms_radius, k_harris, smooth_ksize, device):
     reg_t = torch.from_numpy(region).bool().to(device)
     d = depth.float().clone()
     d[~reg_t] = 0.0
@@ -545,21 +797,24 @@ def _harris_seeds(depth, region, loops, is_hole, tri_uv, P, S, max_corners,
     if ys.numel() == 0:
         return np.empty((0, 2))
     pts = torch.stack([xs.float(), ys.float()], 1).cpu().numpy().astype(np.float64)
-    ok = _inside_loops(pts, loops, is_hole) & ~_covered(pts, tri_uv)
-    pts = pts[ok]
-    return pts[_seg_clearance(pts, P, S) > min_dist] if len(pts) else pts
+    return pts[ok_fn(pts)]
 
-def debug_render_weld(invalid, loops, is_hole, tri_uv, V, faces, ids, seeds):
+
+def debug_render_weld(invalid, loops, is_hole, rings, V, faces, ids, seeds):
     inv = invalid.detach().cpu().numpy().astype(np.uint8)
     H, W = inv.shape
     c = np.zeros((H, W, 3), np.uint8)
     c[inv > 0] = (70, 0, 60)
 
-    for t in tri_uv:                                   # existing model, blue
-        cv2.fillPoly(c, [np.round(t).astype(np.int32)], (25, 35, 70))
-    for t in V[faces]:                                 # new mesh, grey edges
-        cv2.polylines(c, [np.round(t).astype(np.int32)], True,
+    if rings:                                          # kept region, blue
+        cv2.fillPoly(c, [np.round(r).astype(np.int32) for r in rings],
+                     (25, 35, 70))
+    if len(faces):                                     # new mesh, grey edges
+        cv2.polylines(c, list(np.round(V[faces]).astype(np.int32)), True,
                       (150, 150, 150), 1, cv2.LINE_AA)
+    if rings:                                          # seam, white
+        cv2.polylines(c, [np.round(r).astype(np.int32) for r in rings], True,
+                      (255, 255, 255), 1, cv2.LINE_AA)
     for xy, h in zip(loops, is_hole):                  # covariance constraint
         cv2.polylines(c, [np.round(xy).astype(np.int32)], True,
                       (255, 165, 0) if h else (0, 255, 255), 2, cv2.LINE_AA)
@@ -568,62 +823,3 @@ def debug_render_weld(invalid, loops, is_hole, tri_uv, V, faces, ids, seeds):
     for p in seeds:
         cv2.circle(c, tuple(np.round(p).astype(int)), 1, (0, 255, 0), -1)
     return torch.from_numpy(c).float().div(255.).permute(2, 0, 1)
-
-def _validate_pslg(P, S, tol=1e-6):
-    problems = {}
-
-    # 1. zero-length / degenerate segments
-    seg_len = np.linalg.norm(P[S[:, 0]] - P[S[:, 1]], axis=1)
-    problems["zero_len"] = np.where(seg_len < tol)[0]
-
-    # 2. duplicate segments (same endpoints, either order)
-    ss = np.sort(S, axis=1)
-    _, idx, cnt = np.unique(ss, axis=0, return_index=True, return_counts=True)
-    problems["dup_seg"] = int((cnt > 1).sum())
-
-    # 3. near-duplicate vertices at a Triangle-scale tolerance
-    span = P.max(0) - P.min(0)
-    eps = 1e-6 * np.linalg.norm(span)          # Triangle-like relative eps
-    q = np.round(P / max(eps, 1e-9)).astype(np.int64)
-    _, cnt = np.unique(q, axis=0, return_counts=True)
-    problems["near_dup_verts"] = int((cnt > 1).sum())
-
-    # 4. T-junctions: a vertex lying on the interior of a segment
-    A, B = P[S[:, 0]], P[S[:, 1]]
-    AB = B - A
-    L2 = (AB ** 2).sum(1).clip(1e-12)
-    tj = []
-    for vi, p in enumerate(P):
-        t = (((p - A) * AB).sum(1) / L2)
-        proj = A + t[:, None] * AB
-        d = np.linalg.norm(p - proj, axis=1)
-        on = (d < 1e-4) & (t > 1e-4) & (t < 1 - 1e-4)
-        on &= (S[:, 0] != vi) & (S[:, 1] != vi)   # not an endpoint of that seg
-        if on.any():
-            tj.append(vi)
-    problems["t_junctions"] = np.array(tj)
-
-    return problems
-
-def split_at_vertices(P, S, on_tol=1e-4, t_tol=1e-6):
-    """Split any segment that a vertex lands on the interior of (T-junctions)."""
-    A, B = P[S[:, 0]], P[S[:, 1]]
-    AB = B - A
-    L2 = (AB ** 2).sum(1).clip(1e-12)
-    cuts = [[] for _ in range(len(S))]
-    for vi, p in enumerate(P):
-        t = ((p - A) * AB).sum(1) / L2
-        proj = A + t[:, None] * AB
-        d = np.linalg.norm(p - proj, axis=1)
-        on = (d < on_tol) & (t > t_tol) & (t < 1 - t_tol) & \
-             (S[:, 0] != vi) & (S[:, 1] != vi)
-        for si in np.where(on)[0]:
-            cuts[si].append((t[si], vi))
-    out = []
-    for i, cl in enumerate(cuts):
-        if not cl:
-            out.append(tuple(S[i]))
-            continue
-        chain = [S[i, 0]] + [k for _, k in sorted(cl)] + [S[i, 1]]
-        out += [(chain[m], chain[m + 1]) for m in range(len(chain) - 1)]
-    return P, np.array(out, np.int64)

@@ -11,6 +11,7 @@ import numpy as np, math
 from triangle_renderer import render, TriangleModel
 from arguments import PipelineParams
 from argparse import ArgumentParser
+from utils.timing import tic, frame_end, report
 import torchvision
 import matplotlib.pyplot as cm
 
@@ -22,6 +23,12 @@ _pipe.convert_SHs_python = False
 _BG = torch.tensor([0., 0., 0.], device="cuda")  # black background
 
 background = torch.tensor([0., 0., 0.], device="cuda")  # black bg
+
+def _log(msg):
+    """Print only when there is something to print (timing may be disabled)."""
+    if msg:
+        print(msg)
+
 
 ALPHA_SEEN = 0.5  # novelty: below this accumulated alpha => unseen => seed
 FIXED_SIGMA = 0.001  # static sigma for all triangles; no annealing today
@@ -43,32 +50,63 @@ class Keyframe:
 
 
 class TriangleMapper:
-    def __init__(self, device="cuda:0"):
+    def __init__(self, device="cuda:0", debug=True, use_occlusion=True):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.patches = []
+        self.debug = debug                  # seam tile + age view; both debug-only
+        self.use_occlusion = use_occlusion
+        self._model_cache = {}   # (colors_mode, n_patches) -> TriangleModel
 
     def is_empty(self):
         return len(self.patches) == 0
 
     def _build_model(self, colors_mode="rgb"):
-        """Aggregate all patches into a fresh TriangleModel for rendering."""
-        tm = TriangleModel(sh_degree=0)
-        verts, faces, colors, off = [], [], [], 0
-        for p in self.patches:
-            verts.append(p.vertices)
-            faces.append(p.faces + off)
-            off += len(p.vertices)
-            colors.append(p.age_colors if colors_mode == "age" else p.colors)
-        tm.populate_triangle_model(torch.cat(verts), torch.cat(faces), torch.cat(colors), FIXED_SIGMA)
-        with torch.no_grad():
-            tm.vertex_weight.fill_(20.0)
+        """Aggregate all patches into a TriangleModel for rendering.
+
+        Cached on (mode, patch count): this used to run three times per
+        keyframe, each time re-allocating every nn.Parameter and redoing RGB2SH
+        over the whole map.
+        """
+        key = (colors_mode, len(self.patches))
+        if key in self._model_cache:
+            return self._model_cache[key]
+        with tic("build_model"):
+            tm = TriangleModel(sh_degree=0)
+            verts, faces, colors, off = [], [], [], 0
+            for p in self.patches:
+                verts.append(p.vertices)
+                faces.append(p.faces + off)
+                off += len(p.vertices)
+                colors.append(p.age_colors if colors_mode == "age" else p.colors)
+            tm.populate_triangle_model(torch.cat(verts), torch.cat(faces),
+                                       torch.cat(colors), FIXED_SIGMA)
+            with torch.no_grad():
+                tm.vertex_weight.fill_(20.0)
+        # drop entries from earlier keyframes, keep both colour modes of this one
+        self._model_cache = {k: v for k, v in self._model_cache.items()
+                             if k[1] == len(self.patches)}
+        self._model_cache[key] = tm
         return tm
+
+    def _model_boundary_loops(self):
+        """Global boundary rings, from each patch's cached rings plus its offset.
+
+        Never re-derived from the global face array -- that was an O(3T) pass
+        per keyframe over a mesh that grows linearly.
+        """
+        loops, off = [], 0
+        for p in self.patches:
+            for ring in p.boundary_loops():
+                loops.append(ring + off)
+            off += len(p.vertices)
+        return loops
 
     def _render(self, kf, colors_mode="rgb"):
         tm = self._build_model(colors_mode=colors_mode)
         view = make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0])  # W, H
-        return render(view, tm, _pipe, _BG)
+        with tic("render", cuda=True):
+            return render(view, tm, _pipe, _BG)
 
     def render_coverage(self, kf):
         """True accumulated alpha of the existing map, seen from kf."""
@@ -78,12 +116,25 @@ class TriangleMapper:
 
     def integrate(self, record):
         kf = Keyframe(record, self.device)
+        tm, loops, rendered_depth = None, None, None
         if self.patches:
             tm = self._build_model(colors_mode="rgb")
-        else:
-            tm = None
-        patch, image, ids = seed_patch(kf, tm)
-        save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"))
+            loops = self._model_boundary_loops()
+            if self.use_occlusion:
+                pkg = self._render(kf, colors_mode="rgb")   # cache hit on tm
+                rendered_depth = pkg["surf_depth"].squeeze(0)   # (H,W) camera depth
+                self._check_depth_alignment(kf, rendered_depth, pkg["rend_alpha"])
+
+        with tic("seed_patch"):
+            patch, image, ids = seed_patch(kf, tm, model_loops=loops,
+                                           rendered_depth=rendered_depth,
+                                           debug=self.debug)
+        if patch is None:
+            print(f"kf {record.index}: no patch seeded, skipping")
+            _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
+            return
+
+        save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"), ids)
 
         patch.age = record.index
         color = age_to_color(record.index, device=self.device)  # (3,)
@@ -93,7 +144,33 @@ class TriangleMapper:
         # self.optimize() ; self.anneal() ; self.densify()
 
         self.dump_views(kf, self.out_dir, image)
-        print(f"kf {record.index}: {len(patch.faces)} tris, {len(self.patches)} patches")
+        n_weld = int((ids >= 0).sum()) if ids is not None else 0
+        print(f"kf {record.index}: {len(patch.faces)} tris, {len(self.patches)} patches, "
+              f"{n_weld} weldable verts")
+        _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
+
+    def _check_depth_alignment(self, kf, rendered_depth, alpha):
+        """One-shot sanity check that surf_depth is comparable to kf.depth.
+
+        The occlusion test assumes both are camera-space metres. If the
+        rasterizer's convention differs, that assumption fails silently and
+        badly, so measure the disagreement once and say so.
+        """
+        if getattr(self, "_depth_checked", False):
+            return
+        with torch.no_grad():
+            m = (alpha.squeeze(0) > 0.5) & (rendered_depth > 0) & (kf.depth > 0)
+            if m.sum() < 100:
+                return          # too little overlap to judge; try again next frame
+            self._depth_checked = True
+            diff = (rendered_depth[m] - kf.depth[m]).abs().median().item()
+            scale = kf.depth[m].median().item()
+            print(f"[depth-check] median |surf_depth - kf.depth| = {diff:.4f} m "
+                  f"over {int(m.sum())} covered px (median depth {scale:.2f} m)")
+            if diff > 0.25 * max(scale, 1e-6):
+                print("[depth-check] WARNING: surf_depth does not look like "
+                      "camera-space metres. Occlusion culling is probably "
+                      "misfiring; pass rendered_depth=None to disable it.")
 
     def render_age_view(self, kf, path):
         """Deliverable 4: render the whole map age-colored from kf's viewpoint."""
@@ -105,13 +182,13 @@ class TriangleMapper:
         idx = kf.index
 
         pkg_rgb = self._render(kf, colors_mode="rgb")
-        pkg_age = self._render(kf, colors_mode="age")
         alpha = pkg_rgb["rend_alpha"].clamp(0, 1)          # (1,H,W)
         gt = kf.rgb.permute(2, 0, 1)                       # (3,H,W)
 
-        tiles = [gt, pkg_rgb["render"].clamp(0, 1),
-                 pkg_age["render"].clamp(0, 1),
-                 alpha.repeat(3, 1, 1)]
+        tiles = [gt, pkg_rgb["render"].clamp(0, 1)]
+        if self.debug:                                     # age view is debug-only
+            tiles.append(self._render(kf, colors_mode="age")["render"].clamp(0, 1))
+        tiles.append(alpha.repeat(3, 1, 1))
 
         if patch_debug is not None:
             # patch_debug = debug_render_pslg(valid, vertices, segments, holes, points)
@@ -150,7 +227,7 @@ def make_view(kf, W, H):
                   gt_alpha_mask=None, image_name=f"kf{kf.index}", uid=kf.index)
 
 
-def save_patch_npz(patch, path):
+def save_patch_npz(patch, path, ids=None):
     """Write a single patch to a self-contained .npz for the polyscope viewer."""
     def np_(x):
         return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
@@ -159,6 +236,8 @@ def save_patch_npz(patch, path):
         "vertices": np_(patch.vertices).astype(np.float64),
         "faces":    np_(patch.faces).astype(np.int64),
     }
+    if ids is not None:
+        data["weld_ids"] = np_(ids).astype(np.int64)
     if hasattr(patch, "colors"):
         data["colors"] = np.clip(np_(patch.colors), 0, 1).astype(np.float64)
     if hasattr(patch, "age_colors"):
@@ -175,9 +254,14 @@ if __name__ == "__main__":
     p.add_argument("--records_dir")
     p.add_argument("--port", type=int)
     p.add_argument("--max_kf", type=int, default=None)
+    p.add_argument("--fast", action="store_true",
+                   help="skip the seam debug tile and the age render")
+    p.add_argument("--no_occlusion", action="store_true",
+                   help="ignore rendered depth; treat all projected model area as covered")
     args = p.parse_args()
 
-    mapper = TriangleMapper()
+    mapper = TriangleMapper(debug=not args.fast,
+                            use_occlusion=not args.no_occlusion)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
@@ -186,3 +270,4 @@ if __name__ == "__main__":
         mapper.integrate(record)
 
     print(f"Done. {len(mapper.patches)} patches from {len(mapper.patches)} keyframes.")
+    _log(report())

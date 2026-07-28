@@ -9,5 +9,7 @@ cmake
 mediapy
 opencv-python
 matplotlib
+shapely>=2.0
+triangle
 pybind11
 trimesh
