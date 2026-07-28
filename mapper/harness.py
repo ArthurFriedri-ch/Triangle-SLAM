@@ -10,9 +10,9 @@ import slam_interface
 from scene.cameras import Camera
 import numpy as np, math
 from triangle_renderer import render, TriangleModel
-from arguments import PipelineParams
+from arguments import PipelineParams, OptimizationParams
 from argparse import ArgumentParser
-from utils.timing import tic, frame_end, report
+from utils.timing import tic, count, frame_end, report
 from utils.gt_depth import GtDepthSource, depth_dir_for
 from scene.global_mesh import GlobalMesh
 import torchvision
@@ -23,6 +23,10 @@ _pipe = PipelineParams(ArgumentParser()).extract(
     ArgumentParser().parse_args([]))
 _pipe.debug = True
 _pipe.convert_SHs_python = False
+# TS+ optimisation defaults (learning rates, lambda_dssim, ...); the few
+# values that matter per-run are overridden from the command line below.
+_opt = OptimizationParams(ArgumentParser()).extract(
+    ArgumentParser().parse_args([]))
 _BG = torch.tensor([0., 0., 0.], device="cuda")  # black background
 
 background = torch.tensor([0., 0., 0.], device="cuda")  # black bg
@@ -34,7 +38,13 @@ def _log(msg):
 
 
 ALPHA_SEEN = 0.5  # novelty: below this accumulated alpha => unseen => seed
-FIXED_SIGMA = 0.001  # static sigma for all triangles; no annealing today
+# Softness. Global for every triangle -- _sigma is a scalar all the way into
+# CUDA. TS+ trains from 1.0 downwards; the mapper has been running at 0.001,
+# which is a very hard edge by comparison. Set with --sigma.
+FIXED_SIGMA = 0.001
+# Initial per-vertex opacity in (0,1). Stored as a logit internally; the old
+# hard-coded vertex_weight of 20.0 was that logit, i.e. opacity ~1.0.
+INIT_OPACITY = 0.99
 
 
 class Keyframe:
@@ -61,7 +71,10 @@ class TriangleMapper:
                  gt_depth=None, verify_mesh=False,
                  occlusion_rel=OCCLUSION_REL,
                  occlusion_min_area=OCCLUSION_MIN_AREA,
-                 min_region_frac=MIN_REGION_FRAC):
+                 min_region_frac=MIN_REGION_FRAC,
+                 sigma=FIXED_SIGMA, sigma_final=None, sigma_until_s=0.0,
+                 opacity=INIT_OPACITY, iters_per_second=0.0,
+                 record_fps=30.0, opt_window=8, weight_sparsity=False):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.mesh = GlobalMesh(device=device)
@@ -70,6 +83,17 @@ class TriangleMapper:
         self.occlusion_rel = occlusion_rel
         self.occlusion_min_area = occlusion_min_area
         self.min_region_frac = min_region_frac
+        self.sigma0 = sigma                 # initial softness
+        self.sigma_final = sigma if sigma_final is None else sigma_final
+        self.sigma_until_s = sigma_until_s  # anneal span, record seconds
+        self.opacity = opacity              # initial transparency
+        self.iters_per_second = iters_per_second
+        self.record_fps = record_fps
+        self.opt_window = opt_window
+        self.weight_sparsity = weight_sparsity
+        self._views = []                    # cameras with real pixels
+        self._t0 = None
+        self._last_t = None
         self.gt_depth = gt_depth            # GtDepthSource or None
         self.verify_mesh = verify_mesh
         self._n_seen = 0
@@ -92,7 +116,7 @@ class TriangleMapper:
         if key in self._model_cache:
             return self._model_cache[key]
         tm = self.mesh.to_triangle_model(
-            colors_mode=colors_mode, sigma=FIXED_SIGMA, weight=20.0,
+            colors_mode=colors_mode, sigma=self.sigma0, opacity=self.opacity,
             age_to_color=lambda a: age_to_color(a, device=self.device))
         # drop entries from earlier versions, keep both colour modes of this one
         self._model_cache = {k: v for k, v in self._model_cache.items()
@@ -172,7 +196,22 @@ class TriangleMapper:
             if problems:
                 print("[mesh] " + "; ".join(problems))
 
-        # self.optimize() ; self.anneal() ; self.densify()
+        # keep this keyframe's camera, with real pixels, as an optimisation target
+        self._views.append(make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0],
+                                     image=kf.rgb.permute(2, 0, 1)))
+        if len(self._views) > self.opt_window:
+            self._views = self._views[-self.opt_window:]
+
+        # Iterations are budgeted against elapsed *record* time, so a fast pass
+        # over a scene gets proportionally less refinement than a slow one and
+        # the amount of work per second of footage is what you actually set.
+        opt_loss = None
+        if self.iters_per_second > 0:
+            t = self._record_seconds(record.index)
+            dt = t - self._last_t if self._last_t is not None else 0.0
+            self._last_t = t
+            n_iters = int(round(max(dt, 0.0) * self.iters_per_second))
+            opt_loss = self.optimize(n_iters, record.index)
 
         self.dump_views(kf, self.out_dir, image)
         n_weld = int((ids >= 0).sum()) if ids is not None else 0
@@ -181,8 +220,94 @@ class TriangleMapper:
         b_grew = self.mesh.boundary_edge_count() - b_before
         print(f"kf {record.index}: {rec.n_faces} tris, {len(self.mesh.patches)} patches, "
               f"{n_weld} weldable verts, +{rec.n_vertices} new verts, "
-              f"boundary +{b_grew} | {self.mesh.stats()}")
+              f"boundary +{b_grew} | {self.mesh.stats()}"
+              + (f" | opt loss {opt_loss:.4f}" if opt_loss is not None else ""))
         _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
+
+    def optimize(self, n_iters, kf_index):
+        """TS+ photometric refinement over a window of recent keyframes.
+
+        Lifted from `train.py`'s inner loop, minus the parts that have no
+        meaning here: no SH degree ramp (degree 0), and no normal loss, because
+        keyframes carry no normal map. Sigma and the opacity floor anneal on
+        *record time*, not on a global iteration count, since the map is built
+        incrementally and there is no fixed schedule length to anneal against.
+
+        Geometry is optimised on the TriangleModel and pushed back into the mesh
+        afterwards. The Adam state does not survive that round trip -- the model
+        is rebuilt from the mesh on the next keyframe -- so momentum restarts
+        each keyframe. Acceptable while the windows are short; the fix is for
+        the model to persist and be appended to, which needs
+        `cat_tensors_to_optimizer` on the weld path.
+        """
+        if n_iters <= 0 or not self._views:
+            return None
+        from utils.loss_utils import l1_loss, ssim
+
+        tm = self._build_model(colors_mode="rgb")
+        tm.training_setup(_opt, _opt.feature_lr, _opt.weight_lr,
+                          _opt.lr_triangles_points_init)
+        views = self._views[-self.opt_window:]
+
+        losses = []
+        with tic("optimize", cuda=True):
+            for it in range(1, n_iters + 1):
+                tm.update_learning_rate(it)
+                tm.set_sigma(self._sigma_at(kf_index))
+                cam = views[np.random.randint(len(views))]
+
+                pkg = render(cam, tm, _pipe, _BG)
+                image = pkg["render"]
+                gt = cam.original_image
+
+                pixel = l1_loss(image, gt)
+                loss = ((1.0 - _opt.lambda_dssim) * pixel
+                        + _opt.lambda_dssim * (1.0 - ssim(image, gt)))
+                if self.weight_sparsity:
+                    loss = loss + (tm.get_vertex_weight[tm._triangle_indices].mean()
+                                   * _opt.lambda_weight)
+
+                loss.backward()
+                with torch.no_grad():
+                    # running maxima the prune/densify heuristics read
+                    sz = pkg["scaling"].detach()
+                    tm.image_size = torch.maximum(tm.image_size, sz)
+                    imp = pkg["max_blending"].detach()
+                    tm.importance_score = torch.maximum(tm.importance_score, imp)
+                    tm.step_optimizer()
+                    tm.optimizer.zero_grad(set_to_none=True)
+                losses.append(loss.item())
+
+        self.mesh.sync_from(tm)
+        # the mesh now matches this model exactly, so keep it rather than
+        # paying for a rebuild on the very next call
+        self._model_cache = {("rgb", self.mesh.version): tm}
+        count("n_opt_iters", n_iters)
+        return float(np.mean(losses)) if losses else None
+
+    def _sigma_at(self, kf_index):
+        """Anneal softness on record time, from --sigma down to --sigma_final."""
+        t = self._record_seconds(kf_index)
+        if self.sigma_until_s <= 0:
+            return self.sigma0
+        a = min(max(t / self.sigma_until_s, 0.0), 1.0)
+        return self.sigma0 + (self.sigma_final - self.sigma0) * a
+
+    def _record_seconds(self, kf_index):
+        """Elapsed record time at this keyframe, in seconds.
+
+        Uses the dataset's own timestamps when the ground-truth depth loader
+        parsed a TUM rgb.txt, since those are exact and unevenly spaced;
+        otherwise falls back on --record_fps against the frame index.
+        """
+        gt = self.gt_depth
+        assoc = getattr(gt, "_assoc", None) if gt is not None else None
+        if assoc is not None and 0 <= kf_index < len(assoc["rgb_ts"]):
+            ts = assoc["rgb_ts"]
+            if self._t0 is None:
+                self._t0 = float(ts[0])
+            return float(ts[kf_index]) - self._t0
+        return kf_index / max(self.record_fps, 1e-6)
 
     def _check_depth_alignment(self, kf, rendered_depth, alpha):
         """One-shot sanity check that surf_depth is comparable to kf.depth.
@@ -250,15 +375,20 @@ def age_to_color(age, max_age=50, device="cuda"):
     return torch.tensor(rgba[:3], dtype=torch.float32, device=device)  # drop alpha -> (3,)
 
 
-def make_view(kf, W, H):
+def make_view(kf, W, H, image=None):
     w2c = np.linalg.inv(kf.c2w.cpu().numpy())
     R = w2c[:3, :3].T  # Camera expects R transposed (3DGS convention) — verify in cameras.py
     T = w2c[:3, 3]
     fx, fy = kf.K[0, 0].item(), kf.K[1, 1].item()
     FoVx = 2 * math.atan(W / (2 * fx))
     FoVy = 2 * math.atan(H / (2 * fy))
+    # `image` becomes Camera.original_image, which is the photometric target the
+    # optimiser trains against. Rendering alone does not need it, so it stays
+    # optional and defaults to the old dummy.
+    if image is None:
+        image = torch.zeros(3, H, W)
     return Camera(colmap_id=0, R=R, T=T, FoVx=FoVx, FoVy=FoVy,
-                  image=torch.zeros(3, H, W),  # dummy; render doesn't need real pixels
+                  image=image,
                   gt_alpha_mask=None, image_name=f"kf{kf.index}", uid=kf.index)
 
 
@@ -293,6 +423,25 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--sigma", type=float, default=FIXED_SIGMA,
+                   help=f"initial softness for every triangle; default {FIXED_SIGMA} "
+                        "(TS+ trains from 1.0)")
+    p.add_argument("--sigma_final", type=float, default=None,
+                   help="softness to anneal towards; default: no annealing")
+    p.add_argument("--sigma_until", type=float, default=0.0,
+                   help="seconds of record time over which sigma anneals")
+    p.add_argument("--opacity", type=float, default=INIT_OPACITY,
+                   help=f"initial per-vertex opacity in (0,1); default {INIT_OPACITY}")
+    p.add_argument("--iters_per_second", type=float, default=0.0,
+                   help="optimisation iterations per second of RECORD time; "
+                        "0 disables optimisation")
+    p.add_argument("--record_fps", type=float, default=30.0,
+                   help="frame rate used to turn frame indices into record "
+                        "seconds when the dataset carries no timestamps")
+    p.add_argument("--opt_window", type=int, default=8,
+                   help="how many recent keyframes optimisation trains against")
+    p.add_argument("--weight_sparsity", action="store_true",
+                   help="add the TS+ vertex-weight sparsity term to the loss")
     p.add_argument("--min_region_frac", type=float, default=MIN_REGION_FRAC,
                    help="discard isolated seed regions covering less than this "
                         "fraction of the frame from the camera. Note a genuine "
@@ -355,7 +504,14 @@ if __name__ == "__main__":
                             gt_depth=gt, verify_mesh=args.verify_mesh,
                             occlusion_rel=args.occlusion_tol,
                             occlusion_min_area=args.occlusion_min_area,
-                            min_region_frac=args.min_region_frac)
+                            min_region_frac=args.min_region_frac,
+                            sigma=args.sigma, sigma_final=args.sigma_final,
+                            sigma_until_s=args.sigma_until,
+                            opacity=args.opacity,
+                            iters_per_second=args.iters_per_second,
+                            record_fps=args.record_fps,
+                            opt_window=args.opt_window,
+                            weight_sparsity=args.weight_sparsity)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):

@@ -13,6 +13,7 @@ weld time, so any renumbering in between would silently land welds on the wrong
 vertices. Pruning must therefore mark vertices dead rather than renumber, and
 `weld` asserts the version it was seeded against.
 """
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -367,7 +368,7 @@ class GlobalMesh:
 
     # -- handing the map to the renderer ------------------------------------
 
-    def to_triangle_model(self, colors_mode="rgb", sigma=0.001, weight=20.0,
+    def to_triangle_model(self, colors_mode="rgb", sigma=0.001, opacity=0.99,
                           age_to_color=None):
         """Build a TriangleModel over the current mesh.
 
@@ -395,8 +396,33 @@ class GlobalMesh:
                 colors, sigma,
                 patch_id=torch.from_numpy(self.face_patch).to(self.device))
             with torch.no_grad():
-                tm.vertex_weight.fill_(weight)
+                # vertex_weight is a logit; the caller gives a real opacity
+                o = float(min(max(opacity, 1e-4), 1 - 1e-6))
+                tm.vertex_weight.fill_(math.log(o / (1.0 - o)))
         return tm
+
+    def sync_from(self, tm):
+        """Pull optimised vertex positions and colours back out of a model.
+
+        Optimisation runs on the TriangleModel, so without this the next
+        `to_triangle_model` would rebuild from stale geometry and throw the
+        result away. Face topology is owned here and is never taken back from
+        the model -- if the model has pruned or densified, the counts differ and
+        this refuses rather than mismatching vertices to faces.
+        """
+        from utils.sh_utils import SH2RGB
+
+        if len(tm.vertices) != len(self.vertices):
+            raise RuntimeError(
+                f"model has {len(tm.vertices)} vertices, mesh has "
+                f"{len(self.vertices)}; the model was pruned or densified and "
+                f"the mesh cannot absorb that yet")
+        with torch.no_grad():
+            self.vertices = tm.vertices.detach().clone()
+            self.colors = SH2RGB(
+                tm._features_dc.detach()[:, 0, :]).clamp(0, 1).clone()
+        self.version += 1
+        return self
 
     # -- verification ------------------------------------------------------
 
