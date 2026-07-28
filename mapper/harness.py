@@ -1,5 +1,6 @@
 # mapper/harness.py
 import argparse
+import itertools
 import os
 
 import torch
@@ -12,6 +13,7 @@ from triangle_renderer import render, TriangleModel
 from arguments import PipelineParams
 from argparse import ArgumentParser
 from utils.timing import tic, frame_end, report
+from utils.gt_depth import GtDepthSource, depth_dir_for
 import torchvision
 import matplotlib.pyplot as cm
 
@@ -37,9 +39,13 @@ FIXED_SIGMA = 0.001  # static sigma for all triangles; no annealing today
 class Keyframe:
     """Record converted into the mapper's own (torch) world."""
 
-    def __init__(self, record, device):
+    def __init__(self, record, device, depth=None):
         self.index = record.index
-        self.depth = torch.from_numpy(record.depth).float().to(device)
+        # `depth` overrides the record's SLAM depth (ground-truth PNGs). It has
+        # already been divided into the record's scale by GtDepthSource.
+        self.is_gt_depth = depth is not None
+        self.depth = torch.from_numpy(record.depth if depth is None
+                                      else depth).float().to(device)
         self.cov = torch.from_numpy(record.depth_cov).float().to(device)
         self.rgb = torch.from_numpy(record.rgb).float().to(device) / 255.0
         self.K = torch.from_numpy(record.intrinsics).float().to(device)
@@ -50,12 +56,15 @@ class Keyframe:
 
 
 class TriangleMapper:
-    def __init__(self, device="cuda:0", debug=True, use_occlusion=True):
+    def __init__(self, device="cuda:0", debug=True, use_occlusion=True,
+                 gt_depth=None):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.patches = []
         self.debug = debug                  # seam tile + age view; both debug-only
         self.use_occlusion = use_occlusion
+        self.gt_depth = gt_depth            # GtDepthSource or None
+        self._n_seen = 0
         self._model_cache = {}   # (colors_mode, n_patches) -> TriangleModel
 
     def is_empty(self):
@@ -115,7 +124,19 @@ class TriangleMapper:
         return alpha
 
     def integrate(self, record):
-        kf = Keyframe(record, self.device)
+        gt = None
+        if self.gt_depth is not None:
+            gt = self.gt_depth.depth_for(record, self._n_seen)
+            if gt is None:
+                print(f"kf {record.index}: no ground-truth depth found, "
+                      f"falling back to the record's SLAM depth")
+        self._n_seen += 1
+
+        kf = Keyframe(record, self.device, depth=gt)
+        # With ground-truth depth the covariance describes a depth map we are no
+        # longer using, so validity is what bounds the region instead.
+        invalid_mask = (kf.depth <= 0) if kf.is_gt_depth else None
+
         tm, loops, rendered_depth = None, None, None
         if self.patches:
             tm = self._build_model(colors_mode="rgb")
@@ -128,6 +149,7 @@ class TriangleMapper:
         with tic("seed_patch"):
             patch, image, ids = seed_patch(kf, tm, model_loops=loops,
                                            rendered_depth=rendered_depth,
+                                           invalid_mask=invalid_mask,
                                            debug=self.debug)
         if patch is None:
             print(f"kf {record.index}: no patch seeded, skipping")
@@ -258,10 +280,37 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--no_gt_depth", action="store_true",
+                   help="use the record's SLAM depth even if <records_dir>_depth exists")
+    p.add_argument("--gt_depth_dir", default=None,
+                   help="override the ground-truth depth folder")
+    p.add_argument("--gt_depth_scale", type=float, default=None,
+                   help="PNG units per metre (default: 5000 TUM / 6553.5 Replica)")
+    p.add_argument("--gt_depth_no_align", action="store_true",
+                   help="do NOT rescale ground-truth depth into the pose frame. "
+                        "The SLAM is monocular, so its poses carry an arbitrary "
+                        "global scale; without alignment the geometry will not "
+                        "match the camera baselines.")
+    p.add_argument("--gt_depth_probe", type=int, default=8,
+                   help="keyframes used to calibrate the mapping and scale")
     args = p.parse_args()
 
+    gt = None
+    if not args.no_gt_depth and args.records_dir:
+        gt_dir = args.gt_depth_dir or depth_dir_for(args.records_dir)
+        if gt_dir is None:
+            print(f"[gt-depth] no {args.records_dir}_depth folder; "
+                  f"using the record's SLAM depth")
+        else:
+            probe = list(itertools.islice(
+                source_from_dir(args.records_dir), args.gt_depth_probe))
+            gt = GtDepthSource(gt_dir, png_scale=args.gt_depth_scale,
+                               align=not args.gt_depth_no_align).calibrate(probe)
+            print(gt.summary())
+
     mapper = TriangleMapper(debug=not args.fast,
-                            use_occlusion=not args.no_occlusion)
+                            use_occlusion=not args.no_occlusion,
+                            gt_depth=gt)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):

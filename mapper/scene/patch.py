@@ -17,9 +17,10 @@ GRID = 1e-3
 # Match radius when recovering weld ids after the boolean. Must exceed GRID,
 # since set_precision moves surviving vertices by up to half a grid cell.
 ID_TOL = 5e-3
-# Cap on output triangles, as a multiple of the expected count. The tripwire for
-# the sliver blowup above.
+# Cap on output triangles, as a multiple of the expected count, with an absolute
+# floor. The tripwire for the sliver blowup above.
 TRI_BLOWUP_FACTOR = 50
+TRI_BLOWUP_FLOOR = 5000
 
 
 class Patch:
@@ -126,12 +127,17 @@ def seed_patch_grid(kf, mask, step=64, max_depth_jump=0.1, max_cov=5000):
 
 
 def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
-                   max_corners=400, corner_quality=0.01,
+                   invalid_mask=None, max_corners=400, corner_quality=0.01,
                    nms_radius=4, k_harris=0.04, smooth_ksize=5,
                    min_dist=24, cov_max=1e5, debug=True):
     """
-    Triangulate the region that is (inside the covariance contour) AND (not
+    Triangulate the region that is (inside the valid-data contour) AND (not
     already covered by `model` as seen from this camera).
+
+    `invalid_mask` decides what "valid data" means and defaults to
+    `kf.cov > cov_max`. With ground-truth depth the SLAM covariance describes a
+    depth map that is no longer being used, so the caller passes the depth
+    validity mask instead and coverage becomes the only other constraint.
 
     The seam comes from exact polygon arithmetic -- one boolean,
     `cov_region - union(projected model outlines)` -- so the new patch's edge
@@ -153,9 +159,15 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
     H, W = kf.depth.shape
     depth = kf.depth
 
-    # --- 1. covariance loops (vector) ------------------------------------
-    with tic("cov_loops"):
-        res = _cov_loops(kf.cov, cov_max=cov_max)
+    # --- 1. region loops (vector) ----------------------------------------
+    # `invalid_mask` lets the caller choose what bounds the region. With
+    # ground-truth depth the covariance is meaningless, so the caller passes
+    # the depth-validity mask instead and coverage becomes the only other
+    # constraint.
+    if invalid_mask is None:
+        invalid_mask = kf.cov > cov_max
+    with tic("region_loops"):
+        res = _region_loops(invalid_mask)
     if res is None:
         return None, None, None
     loops, is_hole, _markers, region = res      # markers unused now
@@ -249,8 +261,12 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
     # This is what keeps `ids` aligned; it is not documented, so assert it.
     assert np.allclose(V[:nP], P), "Triangle reordered the input vertices; ids misaligned"
 
+    # The ratio alone false-positives on a tiny kept region, where `expected`
+    # rounds to 1 and any legitimate patch trips it; the floor is what makes it
+    # a blowup detector rather than a small-patch filter. Observed real blowups
+    # were 51k and 2.8M triangles, so this sits well below them.
     expected = max(int(keep_mask.sum() / max_area), 1)
-    if len(F_all) > TRI_BLOWUP_FACTOR * expected:
+    if len(F_all) > max(TRI_BLOWUP_FACTOR * expected, TRI_BLOWUP_FLOOR):
         # A sliver survived the boolean. Bail loudly rather than march into the
         # rest of the pipeline with a multi-million-triangle mesh.
         print(f"[seed_patch] triangulation blew up: {len(F_all)} tris vs "
@@ -303,7 +319,7 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
     if not debug:
         return patch, None, ids_full
     with tic("debug_render"):
-        tile = debug_render_weld(kf.cov > cov_max, loops, is_hole, rings,
+        tile = debug_render_weld(invalid_mask, loops, is_hole, rings,
                                  V, faces_np, ids_full, seeds)
     return patch, tile, ids_full
 
@@ -358,13 +374,16 @@ def _mask_from_rings(rings, shape):
     return reg
 
 
-def _cov_loops(cov, cov_max=1e5, margin=2, smooth=5, close_r=3,
-               n_outer=256, n_hole=32, max_iter=5):
+def _region_loops(invalid, margin=2, smooth=5, close_r=3,
+                  n_outer=256, n_hole=32, max_iter=5):
+    """Contour the largest region containing no `invalid` pixel.
+
+    `invalid` is a bool mask -- covariance above threshold, or depth that is
+    not valid. Returns (loops, is_hole, markers, region); `region` is
+    guaranteed to contain no invalid pixel. Loops are the ONLY constraints.
     """
-    Returns (loops, is_hole, markers, region) where `region` is guaranteed to
-    contain no pixel with cov > cov_max. Loops are the ONLY constraints.
-    """
-    inv0 = (cov > cov_max).detach().cpu().numpy().astype(np.uint8)
+    inv0 = (invalid.detach().cpu().numpy() if torch.is_tensor(invalid)
+            else np.asarray(invalid)).astype(np.uint8)
     shape = inv0.shape
     pad = margin + smooth
 
@@ -801,7 +820,8 @@ def _harris_seeds(depth, region, ok_fn, max_corners, corner_quality,
 
 
 def debug_render_weld(invalid, loops, is_hole, rings, V, faces, ids, seeds):
-    inv = invalid.detach().cpu().numpy().astype(np.uint8)
+    inv = (invalid.detach().cpu().numpy() if torch.is_tensor(invalid)
+           else np.asarray(invalid)).astype(np.uint8)
     H, W = inv.shape
     c = np.zeros((H, W, 3), np.uint8)
     c[inv > 0] = (70, 0, 60)
