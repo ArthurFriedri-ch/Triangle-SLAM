@@ -88,7 +88,8 @@ class TriangleMapper:
                  min_region_frac=MIN_REGION_FRAC,
                  sigma=FIXED_SIGMA, sigma_final=None, sigma_until_s=0.0,
                  opacity=INIT_OPACITY, iters_per_second=0.0,
-                 record_fps=30.0, opt_window=8, weight_sparsity=False):
+                 record_fps=30.0, opt_window=8, weight_sparsity=False,
+                 age_max_patches=AGE_MAX_PATCHES):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.mesh = GlobalMesh(device=device)
@@ -105,7 +106,13 @@ class TriangleMapper:
         self.record_fps = record_fps
         self.opt_window = opt_window
         self.weight_sparsity = weight_sparsity
+        self.age_max_patches = age_max_patches
         self._views = []                    # cameras with real pixels
+        self._overview = None               # fixed video camera
+        self._video_mode = "rgb"
+        self._video_fps = 30
+        self._video_dir = None
+        self._video_n = 0
         self._t0 = None
         self._last_t = None
         self.gt_depth = gt_depth            # GtDepthSource or None
@@ -131,7 +138,8 @@ class TriangleMapper:
             return self._model_cache[key]
         tm = self.mesh.to_triangle_model(
             colors_mode=colors_mode, sigma=self.sigma0, opacity=self.opacity,
-            age_to_color=lambda a: age_to_color(a, device=self.device))
+            age_to_color=lambda a: age_to_color(
+                a, self.age_max_patches, device=self.device))
         # drop entries from earlier versions, keep both colour modes of this one
         self._model_cache = {k: v for k, v in self._model_cache.items()
                              if k[1] == self.mesh.version}
@@ -299,6 +307,55 @@ class TriangleMapper:
         count("n_opt_iters", n_iters)
         return float(np.mean(losses)) if losses else None
 
+    def start_video(self, kf, colors_mode="rgb", back=1.5, fov_scale=2.0, fps=30):
+        """Fix the overview camera on the first keyframe and begin recording."""
+        H, W = kf.rgb.shape[0], kf.rgb.shape[1]
+        self._overview = make_overview_view(kf, W, H, back=back,
+                                            fov_scale=fov_scale)
+        self._video_mode = colors_mode
+        self._video_fps = fps
+        self._video_dir = os.path.join(self.out_dir, "video")
+        os.makedirs(self._video_dir, exist_ok=True)
+        for f in os.listdir(self._video_dir):          # start clean
+            if f.endswith(".png"):
+                os.remove(os.path.join(self._video_dir, f))
+        self._video_n = 0
+
+    def record_frame(self):
+        """Render the map from the fixed overview camera into the next frame."""
+        if self._overview is None:
+            return
+        tm = self._build_model(colors_mode=self._video_mode)
+        with tic("video_render", cuda=True):
+            pkg = render(self._overview, tm, _pipe, _BG)
+        torchvision.utils.save_image(
+            pkg["render"].clamp(0, 1),
+            os.path.join(self._video_dir, f"f{self._video_n:06d}.png"))
+        self._video_n += 1
+
+    def run_tail(self, seconds):
+        """Keep optimising after the keyframes run out, recording as it goes.
+
+        The map stops growing here -- there is nothing left to seed -- so this
+        is purely refinement, and it is what shows whether the optimiser is
+        still improving the surface once the geometry has settled.
+        """
+        if self._overview is None or seconds <= 0:
+            return
+        n_frames = int(round(seconds * self._video_fps))
+        per_frame = max(int(round(self.iters_per_second / self._video_fps)), 0)
+        if per_frame == 0:
+            print(f"[video] tail: {n_frames} frames, no optimisation "
+                  f"(--iters_per_second is 0)")
+        else:
+            print(f"[video] tail: {seconds}s, {n_frames} frames, "
+                  f"{per_frame} iterations each")
+        last = self.mesh.patches[-1].kf_index if self.mesh.patches else 0
+        for i in range(n_frames):
+            if per_frame:
+                self.optimize(per_frame, last)
+            self.record_frame()
+
     def _sigma_at(self, kf_index):
         """Anneal softness on record time, from --sigma down to --sigma_final."""
         t = self._record_seconds(kf_index)
@@ -381,12 +438,82 @@ def source_from_socket(port):
     return slam_interface.ipc.RecordReceiver(port=port)
 
 
-def age_to_color(age, max_age=50, device="cuda"):
-    """Map a keyframe age (index) to an RGB color via a colormap."""
-    t = float(age) / max(1, max_age)  # normalize to [0,1]
+AGE_MAX_PATCHES = 200
+
+
+def age_to_color(ordinal, max_patches=AGE_MAX_PATCHES, device="cuda"):
+    """Map a patch's ordinal (0,1,2,...) to a colour along the turbo ramp.
+
+    Takes the patch ordinal, not the keyframe index. Keyframe indices are frame
+    numbers into the source sequence -- freiburg1_room reaches 536 over 99
+    keyframes -- so normalising them against 50 saturated the ramp after about a
+    dozen patches and everything afterwards came out the same colour.
+    """
+    t = float(ordinal) / max(1, max_patches)
     t = min(max(t, 0.0), 1.0)
     rgba = cm.get_cmap("turbo")(t)  # returns (r,g,b,a) in [0,1]
-    return torch.tensor(rgba[:3], dtype=torch.float32, device=device)  # drop alpha -> (3,)
+    return torch.tensor(rgba[:3], dtype=torch.float32, device=device)
+
+
+def make_overview_view(kf, W, H, back=1.5, fov_scale=2.0):
+    """A fixed wide-angle camera sitting behind the given keyframe.
+
+    `back` is measured in multiples of that keyframe's median depth rather than
+    in metres, because the SLAM is monocular and its units are arbitrary -- a
+    fixed distance would be in the scene for one sequence and outside the
+    building for another. `fov_scale` divides the focal length, so 2.0 is
+    roughly twice the field of view.
+    """
+    z = kf.depth[kf.depth > 0]
+    med = float(z.median()) if z.numel() else 1.0
+
+    c2w = kf.c2w.detach().cpu().numpy().copy()
+    # camera looks down +Z in this convention, so -Z is behind it
+    offset = np.array([0.0, 0.0, -back * med, 1.0])
+    c2w[:3, 3] = (c2w @ offset)[:3]
+
+    w2c = np.linalg.inv(c2w)
+    R = w2c[:3, :3].T
+    T = w2c[:3, 3]
+    fx = kf.K[0, 0].item() / fov_scale
+    fy = kf.K[1, 1].item() / fov_scale
+    return Camera(colmap_id=0, R=R, T=T,
+                  FoVx=2 * math.atan(W / (2 * fx)),
+                  FoVy=2 * math.atan(H / (2 * fy)),
+                  image=torch.zeros(3, H, W), gt_alpha_mask=None,
+                  image_name="overview", uid=-1)
+
+
+def encode_video(frame_dir, out_path, fps):
+    """Encode the PNGs in `frame_dir` into a video, if a backend is available."""
+    frames = sorted(f for f in os.listdir(frame_dir) if f.endswith(".png"))
+    if not frames:
+        print("[video] no frames to encode")
+        return None
+    try:
+        import imageio.v2 as imageio
+        with imageio.get_writer(out_path, fps=fps) as w:
+            for f in frames:
+                w.append_data(imageio.imread(os.path.join(frame_dir, f)))
+        print(f"[video] wrote {out_path} ({len(frames)} frames at {fps} fps)")
+        return out_path
+    except Exception as e:
+        import shutil
+        import subprocess
+        if shutil.which("ffmpeg"):
+            cmd = ["ffmpeg", "-y", "-framerate", str(fps),
+                   "-i", os.path.join(frame_dir, "f%06d.png"),
+                   "-pix_fmt", "yuv420p", "-vf",
+                   "pad=ceil(iw/2)*2:ceil(ih/2)*2", out_path]
+            subprocess.run(cmd, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[video] wrote {out_path} ({len(frames)} frames at {fps} fps)")
+            return out_path
+        print(f"[video] {len(frames)} frames in {frame_dir}; no encoder available "
+              f"({e}). Encode with:\n"
+              f"  ffmpeg -framerate {fps} -i {frame_dir}/f%06d.png "
+              f"-pix_fmt yuv420p {out_path}")
+        return None
 
 
 def make_view(kf, W, H, image=None):
@@ -437,6 +564,27 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--age_max_patches", type=int, default=AGE_MAX_PATCHES,
+                   help="patches the age colour ramp spans before it "
+                        "saturates. Set it near the number of keyframes you "
+                        f"expect or the run stays one hue; default {AGE_MAX_PATCHES}")
+    p.add_argument("--video", action="store_true",
+                   help="record the map from a fixed wide-angle camera behind "
+                        "the first keyframe and encode it to a video")
+    p.add_argument("--video_mode", default="rgb", choices=("rgb", "age"),
+                   help="colour the video by texture or by patch age")
+    p.add_argument("--video_back", type=float, default=1.5,
+                   help="how far behind the first keyframe to put the camera, "
+                        "in multiples of that frame's median depth")
+    p.add_argument("--video_fov_scale", type=float, default=2.0,
+                   help="divides the focal length; 2.0 is roughly twice the "
+                        "field of view")
+    p.add_argument("--video_fps", type=int, default=30,
+                   help="frame rate of the output video")
+    p.add_argument("--tail_seconds", type=float, default=5.0,
+                   help="keep optimising and recording for this long after the "
+                        "keyframes run out")
+    p.add_argument("--video_out", default="keyframe_debug/map.mp4")
     p.add_argument("--sigma", type=float, default=FIXED_SIGMA,
                    help=f"initial softness for every triangle; default {FIXED_SIGMA} "
                         "(TS+ trains from 1.0)")
@@ -527,13 +675,26 @@ if __name__ == "__main__":
                             iters_per_second=args.iters_per_second,
                             record_fps=args.record_fps,
                             opt_window=args.opt_window,
-                            weight_sparsity=args.weight_sparsity)
+                            weight_sparsity=args.weight_sparsity,
+                            age_max_patches=args.age_max_patches)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
         if args.max_kf is not None and i >= args.max_kf:
             break
+        if args.video and i == 0:
+            # fix the camera on the first keyframe, before anything is seeded,
+            # so the whole map appears within a stationary frame
+            mapper.start_video(Keyframe(record, mapper.device),
+                               colors_mode=args.video_mode,
+                               back=args.video_back,
+                               fov_scale=args.video_fov_scale,
+                               fps=args.video_fps)
         mapper.integrate(record)
+
+    if args.video:
+        mapper.run_tail(args.tail_seconds)
+        encode_video(mapper._video_dir, args.video_out, args.video_fps)
 
     print(f"Done. {mapper.mesh.stats()}")
     _log(report())

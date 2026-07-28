@@ -381,8 +381,10 @@ class GlobalMesh:
 
         colors = self.colors
         if colors_mode == "age" and age_to_color is not None and len(self.patches):
-            ages = np.array([p.age for p in self.patches], np.int64)
-            per_vertex = ages[self.vertex_patch]
+            # vertex_patch already IS the patch ordinal, and a welded vertex keeps
+            # its creator, so the age render shows when each bit of surface first
+            # appeared rather than when it was last touched
+            per_vertex = self.vertex_patch.astype(np.int64)
             uniq = np.unique(per_vertex)                       # one colour per age
             lut = torch.stack([age_to_color(int(a)) for a in uniq]).to(self.device)
             colors = lut[torch.from_numpy(
