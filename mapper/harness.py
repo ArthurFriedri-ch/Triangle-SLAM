@@ -205,7 +205,7 @@ class TriangleMapper:
         if patch is None:
             print(f"kf {record.index}: no patch seeded, skipping")
             _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
-            self.record_frame()      # hold the frame; the map did not change
+            self._advance(self._elapsed(record.index), record.index)
             return
 
         save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"), ids)
@@ -226,16 +226,7 @@ class TriangleMapper:
         if len(self._views) > self.opt_window:
             self._views = self._views[-self.opt_window:]
 
-        # Iterations are budgeted against elapsed *record* time, so a fast pass
-        # over a scene gets proportionally less refinement than a slow one and
-        # the amount of work per second of footage is what you actually set.
-        opt_loss = None
-        if self.iters_per_second > 0:
-            t = self._record_seconds(record.index)
-            dt = t - self._last_t if self._last_t is not None else 0.0
-            self._last_t = t
-            n_iters = int(round(max(dt, 0.0) * self.iters_per_second))
-            opt_loss = self.optimize(n_iters, record.index)
+        opt_loss = self._advance(self._elapsed(record.index), record.index)
 
         self.dump_views(kf, self.out_dir, image)
         n_weld = int((ids >= 0).sum()) if ids is not None else 0
@@ -247,7 +238,6 @@ class TriangleMapper:
               f"boundary +{b_grew} | {self.mesh.stats()}"
               + (f" | opt loss {opt_loss:.4f}" if opt_loss is not None else ""))
         _log(frame_end(record.index, os.path.join(self.out_dir, "timings.csv")))
-        self.record_frame()
 
     def optimize(self, n_iters, kf_index):
         """TS+ photometric refinement over a window of recent keyframes.
@@ -310,9 +300,10 @@ class TriangleMapper:
         count("n_opt_iters", n_iters)
         return float(np.mean(losses)) if losses else None
 
-    def start_video(self, kf, colors_mode="rgb", back=1.5, fov_scale=2.0, fps=30):
+    def start_video(self, kf, colors_mode="rgb", back=1.5, fov_scale=2.0, fps=30,
+                    size=(1280, 720)):
         """Fix the overview camera on the first keyframe and begin recording."""
-        H, W = kf.rgb.shape[0], kf.rgb.shape[1]
+        W, H = size
         self._overview = make_overview_view(kf, W, H, back=back,
                                             fov_scale=fov_scale)
         self._video_mode = colors_mode
@@ -358,6 +349,36 @@ class TriangleMapper:
             if per_frame:
                 self.optimize(per_frame, last)
             self.record_frame()
+
+
+    def _elapsed(self, kf_index):
+        """Record seconds since the previous keyframe."""
+        t = self._record_seconds(kf_index)
+        dt = (t - self._last_t) if self._last_t is not None \
+            else 1.0 / max(self.record_fps, 1e-6)   # give the first frame a slice
+        self._last_t = t
+        return max(dt, 0.0)
+
+    def _advance(self, dt, kf_index):
+        """Carry the map forward over `dt` seconds of record time.
+
+        The interval's iteration budget is split across the video frames that
+        span it, rather than run as one burst at the keyframe. Refinement is
+        continuous, and because the frame count is dt * video_fps the video
+        plays back at record speed -- a keyframe after a long pause gets both
+        more iterations and more frames, in proportion.
+        """
+        total = int(round(dt * self.iters_per_second))
+        frames = max(int(round(dt * self._video_fps)), 1) if self._overview else 1
+        losses = []
+        for i in range(frames):
+            n = total // frames + (1 if i < total % frames else 0)
+            if n:
+                got = self.optimize(n, kf_index)
+                if got is not None:
+                    losses.append(got)
+            self.record_frame()
+        return float(np.mean(losses)) if losses else None
 
     def _sigma_at(self, kf_index):
         """Anneal softness on record time, from --sigma down to --sigma_final."""
@@ -416,19 +437,19 @@ class TriangleMapper:
         idx = kf.index
 
         pkg_rgb = self._render(kf, colors_mode="rgb")
-        alpha = pkg_rgb["rend_alpha"].clamp(0, 1)          # (1,H,W)
         gt = kf.rgb.permute(2, 0, 1)                       # (3,H,W)
 
+        # 2x2: ground truth | render / age | seam. Accumulated alpha is dropped;
+        # it duplicated what the render and the seam tile already show.
         tiles = [gt, pkg_rgb["render"].clamp(0, 1)]
         if self.debug:                                     # age view is debug-only
             tiles.append(self._render(kf, colors_mode="age")["render"].clamp(0, 1))
-        tiles.append(alpha.repeat(3, 1, 1))
-
         if patch_debug is not None:
-            # patch_debug = debug_render_pslg(valid, vertices, segments, holes, points)
             tiles.append(patch_debug.to(gt.device))
-
-        panel = torch.cat(tiles, dim=2)                    # concat along width
+        while len(tiles) < 4:
+            tiles.append(torch.zeros_like(gt))
+        panel = torch.cat([torch.cat(tiles[0:2], dim=2),
+                           torch.cat(tiles[2:4], dim=2)], dim=1)
         torchvision.utils.save_image(
             panel, os.path.join(out_dir, f"kf{idx:04d}_panel.png"))
 
@@ -458,7 +479,7 @@ def age_to_color(ordinal, max_patches=AGE_MAX_PATCHES, device="cuda"):
     return torch.tensor(rgba[:3], dtype=torch.float32, device=device)
 
 
-def make_overview_view(kf, W, H, back=1.5, fov_scale=2.0):
+def make_overview_view(kf, out_w, out_h, back=1.5, fov_scale=2.0):
     """A fixed wide-angle camera sitting behind the given keyframe.
 
     `back` is measured in multiples of that keyframe's median depth rather than
@@ -466,7 +487,12 @@ def make_overview_view(kf, W, H, back=1.5, fov_scale=2.0):
     fixed distance would be in the scene for one sequence and outside the
     building for another. `fov_scale` divides the focal length, so 2.0 is
     roughly twice the field of view.
+
+    The output resolution is independent of the keyframes'. The focal length is
+    scaled by the resolution ratio first, so raising the resolution adds pixels
+    instead of silently widening the shot -- only `fov_scale` changes framing.
     """
+    src_h, src_w = kf.depth.shape
     z = kf.depth[kf.depth > 0]
     med = float(z.median()) if z.numel() else 1.0
 
@@ -478,12 +504,12 @@ def make_overview_view(kf, W, H, back=1.5, fov_scale=2.0):
     w2c = np.linalg.inv(c2w)
     R = w2c[:3, :3].T
     T = w2c[:3, 3]
-    fx = kf.K[0, 0].item() / fov_scale
-    fy = kf.K[1, 1].item() / fov_scale
+    fx = kf.K[0, 0].item() * (out_w / src_w) / fov_scale
+    fy = kf.K[1, 1].item() * (out_h / src_h) / fov_scale
     return Camera(colmap_id=0, R=R, T=T,
-                  FoVx=2 * math.atan(W / (2 * fx)),
-                  FoVy=2 * math.atan(H / (2 * fy)),
-                  image=torch.zeros(3, H, W), gt_alpha_mask=None,
+                  FoVx=2 * math.atan(out_w / (2 * fx)),
+                  FoVy=2 * math.atan(out_h / (2 * fy)),
+                  image=torch.zeros(3, out_h, out_w), gt_alpha_mask=None,
                   image_name="overview", uid=-1)
 
 
@@ -582,6 +608,8 @@ if __name__ == "__main__":
     p.add_argument("--video_fov_scale", type=float, default=2.0,
                    help="divides the focal length; 2.0 is roughly twice the "
                         "field of view")
+    p.add_argument("--video_width", type=int, default=1280)
+    p.add_argument("--video_height", type=int, default=720)
     p.add_argument("--video_fps", type=int, default=30,
                    help="frame rate of the output video")
     p.add_argument("--tail_seconds", type=float, default=5.0,
@@ -692,7 +720,8 @@ if __name__ == "__main__":
                                colors_mode=args.video_mode,
                                back=args.video_back,
                                fov_scale=args.video_fov_scale,
-                               fps=args.video_fps)
+                               fps=args.video_fps,
+                               size=(args.video_width, args.video_height))
         mapper.integrate(record)
 
     if args.video:
