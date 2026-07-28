@@ -30,7 +30,13 @@ _opt_group = OptimizationParams(_defaults_parser)
 _defaults = _defaults_parser.parse_args([])
 
 _pipe = _pipe_group.extract(_defaults)
-_pipe.debug = True
+# Must stay False. The rasterizer's debug path is not a no-op: it deep-copies
+# every argument to CPU on each forward *and* backward so it can dump a snapshot
+# on exception, and its backward branch still unpacks five gradients from a
+# kernel that returns four, so it raises before the real error it exists to
+# catch. TS+ itself defaults this to False and only flips it at --debug_from.
+# Harmless while nothing called backward; fatal once optimisation does.
+_pipe.debug = False
 _pipe.convert_SHs_python = False
 # learning rates, lambda_dssim, ...; the few values that matter per-run are
 # overridden from the command line below.
