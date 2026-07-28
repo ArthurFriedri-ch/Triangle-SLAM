@@ -4,7 +4,7 @@ import os
 
 import torch
 
-from scene.patch import seed_patch
+from scene.patch import seed_patch, OCCLUSION_REL, OCCLUSION_MIN_AREA
 import slam_interface
 from scene.cameras import Camera
 import numpy as np, math
@@ -57,12 +57,16 @@ class Keyframe:
 
 class TriangleMapper:
     def __init__(self, device="cuda:0", debug=True, use_occlusion=True,
-                 gt_depth=None, verify_mesh=False):
+                 gt_depth=None, verify_mesh=False,
+                 occlusion_rel=OCCLUSION_REL,
+                 occlusion_min_area=OCCLUSION_MIN_AREA):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.mesh = GlobalMesh(device=device)
         self.debug = debug                  # seam tile + age view; both debug-only
         self.use_occlusion = use_occlusion
+        self.occlusion_rel = occlusion_rel
+        self.occlusion_min_area = occlusion_min_area
         self.gt_depth = gt_depth            # GtDepthSource or None
         self.verify_mesh = verify_mesh
         self._n_seen = 0
@@ -144,6 +148,8 @@ class TriangleMapper:
             patch, image, ids = seed_patch(kf, tm, model_loops=loops,
                                            rendered_depth=rendered_depth,
                                            invalid_mask=invalid_mask,
+                                           occlusion_rel=self.occlusion_rel,
+                                           occlusion_min_area=self.occlusion_min_area,
                                            debug=self.debug)
         if patch is None:
             print(f"kf {record.index}: no patch seeded, skipping")
@@ -283,6 +289,14 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--occlusion_tol", type=float, default=OCCLUSION_REL,
+                   help="how much further the map must be than the measured "
+                        "depth, as a FRACTION of that depth, before its area is "
+                        "re-opened for seeding. Raise to reduce doubling; "
+                        f"default {OCCLUSION_REL}")
+    p.add_argument("--occlusion_min_area", type=int, default=OCCLUSION_MIN_AREA,
+                   help="smallest re-opened region worth believing, in pixels; "
+                        f"default {OCCLUSION_MIN_AREA}")
     p.add_argument("--verify_mesh", action="store_true",
                    help="check mesh invariants after every weld (slow)")
     p.add_argument("--no_gt_depth", action="store_true",
@@ -329,7 +343,9 @@ if __name__ == "__main__":
 
     mapper = TriangleMapper(debug=not args.fast,
                             use_occlusion=not args.no_occlusion,
-                            gt_depth=gt, verify_mesh=args.verify_mesh)
+                            gt_depth=gt, verify_mesh=args.verify_mesh,
+                            occlusion_rel=args.occlusion_tol,
+                            occlusion_min_area=args.occlusion_min_area)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):

@@ -167,6 +167,40 @@ def test_occlusion_reopens_what_the_camera_sees_past():
     assert m_off[150:330, 200:420].mean() < 0.1, "box was already kept without occlusion"
 
 
+def test_occlusion_tolerance_scales_with_depth():
+    """The re-open test must be relative, not a fixed distance.
+
+    Triangulation error grows roughly with z^2, so one absolute threshold is
+    too tight far away and too loose up close. Every misfire re-opens covered
+    ground and seeds a second surface layer over it.
+    """
+    import torch
+    H, W = 200, 200
+    kd = np.empty((H, W), np.float32)
+    kd[:100] = 0.5                       # near half
+    kd[100:] = 1.5                       # far half
+
+    # the map uniformly 8% further away: within a 10% budget everywhere
+    rd = (kd * 1.08).astype(np.float32)
+    assert patch._revealed_polygons(torch.from_numpy(rd), torch.from_numpy(kd),
+                                    (H, W), rel=0.10, min_area=50) is None, \
+        "a uniform 8% offset should sit inside a 10% budget at every depth"
+    assert patch._revealed_polygons(torch.from_numpy(rd), torch.from_numpy(kd),
+                                    (H, W), rel=0.05, min_area=50) is not None, \
+        "a uniform 8% offset should exceed a 5% budget"
+
+    # an absolute threshold cannot do that: 0.1 units is 20% near and 6.7% far,
+    # so only the near half should trip a 10% relative test
+    rd = kd + 0.1
+    got = patch._revealed_polygons(torch.from_numpy(rd.astype(np.float32)),
+                                   torch.from_numpy(kd), (H, W),
+                                   rel=0.10, min_area=50)
+    assert got is not None and got.area > 0
+    # the re-opened area is the near half only, give or take the morphology
+    assert 0.6 < got.area / (100 * W) < 1.2, \
+        f"expected roughly the near half re-opened, got area {got.area}"
+
+
 def test_thin_respects_separation():
     rng = np.random.default_rng(0)
     pts = rng.random((2000, 2)) * 200

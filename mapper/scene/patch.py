@@ -22,6 +22,17 @@ ID_TOL = 5e-3
 TRI_BLOWUP_FACTOR = 50
 TRI_BLOWUP_FLOOR = 5000
 
+# Occlusion: how much further away the map has to be, as a fraction of the
+# measured depth, before its area is re-opened for seeding. Relative because
+# triangulation error grows with depth. Raise it to make the check coarser --
+# every misfire seeds a second surface layer over ground the map already has.
+OCCLUSION_REL = 0.10
+# Absolute backstop in record units, so the budget does not vanish near zero.
+OCCLUSION_FLOOR = 0.02
+# Smallest re-opened blob worth believing, in pixels. Speckle at this scale is
+# depth noise along discontinuities, not a genuinely occluded surface.
+OCCLUSION_MIN_AREA = 200
+
 
 class Patch:
     """One keyframe's seeded geometry. Geometry only today."""
@@ -127,9 +138,11 @@ def seed_patch_grid(kf, mask, step=64, max_depth_jump=0.1, max_cov=5000):
 
 
 def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
-                   invalid_mask=None, max_corners=400, corner_quality=0.01,
-                   nms_radius=4, k_harris=0.04, smooth_ksize=5,
-                   min_dist=24, cov_max=1e5, debug=True):
+                   invalid_mask=None, occlusion_rel=OCCLUSION_REL,
+                   occlusion_min_area=OCCLUSION_MIN_AREA,
+                   max_corners=400, corner_quality=0.01,
+                   nms_radius=3, k_harris=0.04, smooth_ksize=5,
+                   min_dist=10, cov_max=1e5, debug=True):
     """
     Triangulate the region that is (inside the valid-data contour) AND (not
     already covered by `model` as seen from this camera).
@@ -188,7 +201,9 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
     with tic("seam_boolean"):
         occluders = None
         if rendered_depth is not None and len(rings_uv):
-            occluders = _revealed_polygons(rendered_depth, depth, (H, W))
+            occluders = _revealed_polygons(rendered_depth, depth, (H, W),
+                                           rel=occlusion_rel,
+                                           min_area=occlusion_min_area)
         rings, ring_ids, holes_xy, stats = seam_boolean(
             loops, is_hole, rings_uv, rings_id, revealed=occluders)
     for k, v in stats.items():
@@ -722,14 +737,25 @@ def _id_lookup(query, key_xy, key_ids, tol=ID_TOL):
     return out, int((out >= 0).sum()), dup
 
 
-def _revealed_polygons(rendered_depth, kf_depth, shape, tol=0.05,
-                       min_area=64, open_r=2):
+def _revealed_polygons(rendered_depth, kf_depth, shape, rel=OCCLUSION_REL,
+                       min_area=OCCLUSION_MIN_AREA, open_r=2,
+                       floor=OCCLUSION_FLOOR):
     """Where the model sits *behind* what this keyframe measures.
 
     Those pixels show a surface in front of the model that has never been
     seeded, so they must not count as covered. This is the only occlusion case
     that is unambiguous: the reverse (model in front of the measurement) means
     one of the two is wrong, and guessing there would cause more harm.
+
+    The test is *relative*: triangulation depth error grows roughly with z^2, so
+    a single absolute threshold is simultaneously too tight far away and too
+    loose up close. It fires when the map is further than `kd * (1 + rel)`, with
+    `floor` as an absolute backstop so the budget does not vanish as depth goes
+    to zero. Both depths are in the record's own units -- the SLAM is monocular,
+    so those are not metres; see utils/gt_depth.py.
+
+    Loosening this is what stops the map doubling: every misfire re-opens
+    already-covered area and seeds a second surface layer over it.
 
     Pixel-accurate by construction -- but the seam it produces separates new
     geometry from new geometry, with no model vertex to weld to, so exactness
@@ -741,7 +767,9 @@ def _revealed_polygons(rendered_depth, kf_depth, shape, tol=0.05,
         else np.asarray(kf_depth)
     if rd.shape != shape:
         return None
-    mask = ((rd > 0) & (kd > 0) & (rd > kd + tol)).astype(np.uint8)
+    gap = np.maximum(kd * rel, floor)
+    mask = ((rd > 0) & (kd > 0) & (rd > kd + gap)).astype(np.uint8)
+    count("n_revealed_px", int(mask.sum()))
     if not mask.any():
         return None
     if open_r:
