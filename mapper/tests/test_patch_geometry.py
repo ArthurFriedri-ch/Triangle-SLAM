@@ -167,6 +167,36 @@ def test_occlusion_reopens_what_the_camera_sees_past():
     assert m_off[150:330, 200:420].mean() < 0.1, "box was already kept without occlusion"
 
 
+def test_min_region_area_drops_isolated_specks():
+    """Isolated scraps of frontier must not become their own mesh islands.
+
+    Subtracting the map's coverage leaves specks beside the real frontier, and
+    each one would otherwise be triangulated into a disconnected fragment.
+    """
+    cov = [_ring(320, 240, 300, 225, 128)]
+    # one big region and two specks, none overlapping
+    model = [_ring(320, 240, 240, 170, 96)]      # covers the middle
+    ids = [np.arange(96)]
+
+    big, _, _, s0 = patch.seam_boolean(cov, [False], model, ids,
+                                       min_region_area=0.0)
+    # with no floor the annulus is one region; add specks by punching the cov
+    # ring into pieces via a second model ring that nearly severs it
+    speck_cov = [_ring(50, 50, 6, 6, 16)]        # ~113 px^2
+    r_small, _, _, _ = patch.seam_boolean(speck_cov, [False], [], [],
+                                          min_region_area=0.0)
+    assert r_small, "a small region should survive with no floor"
+    r_none, _, _, st = patch.seam_boolean(speck_cov, [False], [], [],
+                                          min_region_area=500.0)
+    assert not r_none, "a 113 px^2 region should be dropped by a 500 px^2 floor"
+    assert st["n_regions_too_small"] == 1
+
+    # the floor must not eat a legitimately large region
+    r_keep, _, _, _ = patch.seam_boolean(cov, [False], model, ids,
+                                         min_region_area=500.0)
+    assert r_keep and len(r_keep) == len(big)
+
+
 def test_occlusion_tolerance_scales_with_depth():
     """The re-open test must be relative, not a fixed distance.
 

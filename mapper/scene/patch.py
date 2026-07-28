@@ -33,6 +33,13 @@ OCCLUSION_FLOOR = 0.02
 # depth noise along discontinuities, not a genuinely occluded surface.
 OCCLUSION_MIN_AREA = 200
 
+# Smallest isolated region worth seeding, as a fraction of the frame seen from
+# this camera. Subtracting the map's coverage leaves specks beside the real
+# frontier; each would become its own disconnected scrap of mesh. Keep this
+# well below the size of legitimate new growth -- once the map covers most of
+# the view, a genuine new region is only a fraction of a percent.
+MIN_REGION_FRAC = 0.001
+
 
 class Patch:
     """One keyframe's seeded geometry. Geometry only today."""
@@ -138,7 +145,8 @@ def seed_patch_grid(kf, mask, step=64, max_depth_jump=0.1, max_cov=5000):
 
 
 def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
-                   invalid_mask=None, occlusion_rel=OCCLUSION_REL,
+                   invalid_mask=None, min_region_frac=MIN_REGION_FRAC,
+                   occlusion_rel=OCCLUSION_REL,
                    occlusion_min_area=OCCLUSION_MIN_AREA,
                    max_corners=400, corner_quality=0.01,
                    nms_radius=3, k_harris=0.04, smooth_ksize=5,
@@ -205,7 +213,8 @@ def seed_patch_cdt(kf, model=None, model_loops=None, rendered_depth=None,
                                            rel=occlusion_rel,
                                            min_area=occlusion_min_area)
         rings, ring_ids, holes_xy, stats = seam_boolean(
-            loops, is_hole, rings_uv, rings_id, revealed=occluders)
+            loops, is_hole, rings_uv, rings_id, revealed=occluders,
+            min_region_area=min_region_frac * H * W)
     for k, v in stats.items():
         count(k, v)
     if not rings:
@@ -789,8 +798,15 @@ def _revealed_polygons(rendered_depth, kf_depth, shape, rel=OCCLUSION_REL,
 
 
 def seam_boolean(cov_loops, cov_is_hole, model_uv, model_ids,
-                 revealed=None, grid=GRID, tol=ID_TOL, min_ring_area=1e-3):
+                 revealed=None, grid=GRID, tol=ID_TOL, min_ring_area=1e-3,
+                 min_region_area=0.0):
     """cov_region - union(projected model rings), as simple tagged rings.
+
+    `min_region_area` discards whole regions smaller than that many pixels as
+    seen from this camera. Subtracting the map's coverage routinely leaves a
+    handful of specks alongside the real frontier, and each one would otherwise
+    become its own disconnected scrap of mesh. Screen area is the right measure
+    because it is what the triangulation actually works in.
 
     Returns (rings, ring_ids, holes_xy, stats). The rings are simple, disjoint
     and correctly nested by construction, so the PSLG built from them has no
@@ -829,8 +845,10 @@ def seam_boolean(cov_loops, cov_is_hole, model_uv, model_ids,
 
     rings, ring_ids, holes_xy = [], [], []
     n_pts = 0
+    n_small = 0
     for g in _as_polygons(keep):
-        if g.area < min_ring_area:
+        if g.area < max(min_ring_area, min_region_area):
+            n_small += 1
             continue
         for i, r in enumerate([g.exterior, *g.interiors]):
             xy = np.asarray(r.coords)[:-1]          # drop the repeated close
@@ -849,6 +867,7 @@ def seam_boolean(cov_loops, cov_is_hole, model_uv, model_ids,
         stats.update(n_seam_pts=n_pts, n_ids_recovered=n_hit,
                      n_id_bucket_collisions=n_dup, n_model_pts=len(key_xy))
     stats["n_rings"] = len(rings)
+    stats["n_regions_too_small"] = n_small
     return rings, ring_ids, np.array(holes_xy, np.float64).reshape(-1, 2), stats
 
 

@@ -4,7 +4,8 @@ import os
 
 import torch
 
-from scene.patch import seed_patch, OCCLUSION_REL, OCCLUSION_MIN_AREA
+from scene.patch import (seed_patch, OCCLUSION_REL, OCCLUSION_MIN_AREA,
+                        MIN_REGION_FRAC)
 import slam_interface
 from scene.cameras import Camera
 import numpy as np, math
@@ -59,7 +60,8 @@ class TriangleMapper:
     def __init__(self, device="cuda:0", debug=True, use_occlusion=True,
                  gt_depth=None, verify_mesh=False,
                  occlusion_rel=OCCLUSION_REL,
-                 occlusion_min_area=OCCLUSION_MIN_AREA):
+                 occlusion_min_area=OCCLUSION_MIN_AREA,
+                 min_region_frac=MIN_REGION_FRAC):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.mesh = GlobalMesh(device=device)
@@ -67,6 +69,7 @@ class TriangleMapper:
         self.use_occlusion = use_occlusion
         self.occlusion_rel = occlusion_rel
         self.occlusion_min_area = occlusion_min_area
+        self.min_region_frac = min_region_frac
         self.gt_depth = gt_depth            # GtDepthSource or None
         self.verify_mesh = verify_mesh
         self._n_seen = 0
@@ -148,6 +151,7 @@ class TriangleMapper:
             patch, image, ids = seed_patch(kf, tm, model_loops=loops,
                                            rendered_depth=rendered_depth,
                                            invalid_mask=invalid_mask,
+                                           min_region_frac=self.min_region_frac,
                                            occlusion_rel=self.occlusion_rel,
                                            occlusion_min_area=self.occlusion_min_area,
                                            debug=self.debug)
@@ -289,6 +293,11 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--min_region_frac", type=float, default=MIN_REGION_FRAC,
+                   help="discard isolated seed regions covering less than this "
+                        "fraction of the frame from the camera. Note a genuine "
+                        "new region is only a fraction of a percent once the map "
+                        f"covers most of the view; default {MIN_REGION_FRAC}")
     p.add_argument("--occlusion_tol", type=float, default=OCCLUSION_REL,
                    help="how much further the map must be than the measured "
                         "depth, as a FRACTION of that depth, before its area is "
@@ -345,7 +354,8 @@ if __name__ == "__main__":
                             use_occlusion=not args.no_occlusion,
                             gt_depth=gt, verify_mesh=args.verify_mesh,
                             occlusion_rel=args.occlusion_tol,
-                            occlusion_min_area=args.occlusion_min_area)
+                            occlusion_min_area=args.occlusion_min_area,
+                            min_region_frac=args.min_region_frac)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
