@@ -16,6 +16,7 @@ from argparse import ArgumentParser
 from utils.timing import tic, count, frame_end, report, totals
 from utils.gt_depth import GtDepthSource, depth_dir_for
 from scene.global_mesh import GlobalMesh
+import evaluate as ev
 import torchvision
 import matplotlib.pyplot as cm
 
@@ -93,7 +94,7 @@ class TriangleMapper:
                  sigma=FIXED_SIGMA, sigma_final=SIGMA_FINAL, sigma_anneal_s=10.0,
                  opacity=INIT_OPACITY, iters_per_second=0.0,
                  record_fps=30.0, opt_window=8, weight_sparsity=False,
-                 age_max_patches=AGE_MAX_PATCHES):
+                 age_max_patches=AGE_MAX_PATCHES, eval_holdout=0):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.mesh = GlobalMesh(device=device)
@@ -111,6 +112,8 @@ class TriangleMapper:
         self.opt_window = opt_window
         self.weight_sparsity = weight_sparsity
         self.age_max_patches = age_max_patches
+        self.eval_holdout = eval_holdout   # keep every Nth keyframe out
+        self._eval_views = []              # kept on CPU; see evaluate()
         self._views = []                    # cameras with real pixels
         self._overview = None               # fixed video camera
         self._video_mode = "rgb"
@@ -279,11 +282,22 @@ class TriangleMapper:
             if problems:
                 print("[mesh] " + "; ".join(problems))
 
-        # keep this keyframe's camera, with real pixels, as an optimisation target
-        self._views.append(make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0],
-                                     image=kf.rgb.permute(2, 0, 1)))
-        if len(self._views) > self.opt_window:
-            self._views = self._views[-self.opt_window:]
+        # Every keyframe becomes an evaluation view. A held-out one is still
+        # seeded and welded -- its geometry belongs in the map -- but is never
+        # an optimisation target, so it measures generalisation rather than fit.
+        rgb_chw = kf.rgb.permute(2, 0, 1)
+        heldout = (self.eval_holdout > 0
+                   and len(self.mesh.patches) % self.eval_holdout == 0
+                   and len(self.mesh.patches) > 1)
+        cam = make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0], image=rgb_chw)
+        self._eval_views.append({
+            "name": f"kf{record.index:04d}", "camera": cam,
+            "rgb": rgb_chw.detach().cpu(), "depth": kf.depth.detach().cpu(),
+            "heldout": heldout})
+        if not heldout:
+            self._views.append(cam)
+            if len(self._views) > self.opt_window:
+                self._views = self._views[-self.opt_window:]
 
         opt_loss = self._advance(self._elapsed(record.index), record.index)
 
@@ -456,6 +470,23 @@ class TriangleMapper:
                     losses.append(got)
             self.record_frame()
         return float(np.mean(losses)) if losses else None
+
+    def evaluate(self, use_lpips=False, json_path=None):
+        """Score the finished map on every keyframe it saw."""
+        if self._model is None or not self._eval_views:
+            return None
+        mpu = getattr(self.gt_depth, "scale", None) if self.gt_depth else None
+        if self.gt_depth is not None and self.gt_depth.align == "per_frame":
+            mpu = None      # the factor varies per keyframe; one number would lie
+        with tic("evaluate", cuda=True):
+            rows = ev.evaluate(self._model, self._eval_views,
+                               lambda cam, m: render(cam, m, _pipe, _BG),
+                               use_lpips=use_lpips, device=self.device)
+        agg = ev.aggregate(rows, metres_per_unit=mpu)
+        if json_path:
+            ev.save(rows, agg, json_path)
+            print(f"[eval] per-view metrics written to {json_path}")
+        return ev.format_report(agg, metres_per_unit=mpu)
 
     def summary(self):
         """End-of-run accounting: where the time went and what came out."""
@@ -753,6 +784,16 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--evaluate", action="store_true",
+                   help="score the finished map on every keyframe and print a report")
+    p.add_argument("--eval_holdout", type=int, default=0,
+                   help="keep every Nth keyframe out of the optimisation targets "
+                        "so it can be scored as a held-out view. Its geometry is "
+                        "still seeded and welded; only the photometric loss skips "
+                        "it. 0 means evaluate on trained-on views only")
+    p.add_argument("--eval_lpips", action="store_true",
+                   help="also compute LPIPS (slow, downloads VGG weights)")
+    p.add_argument("--eval_json", default="keyframe_debug/eval.json")
     p.add_argument("--age_max_patches", type=int, default=AGE_MAX_PATCHES,
                    help="patches the age colour ramp spans before it "
                         "saturates. Set it near the number of keyframes you "
@@ -870,7 +911,8 @@ if __name__ == "__main__":
                             record_fps=args.record_fps,
                             opt_window=args.opt_window,
                             weight_sparsity=args.weight_sparsity,
-                            age_max_patches=args.age_max_patches)
+                            age_max_patches=args.age_max_patches,
+                            eval_holdout=args.eval_holdout)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
@@ -892,4 +934,7 @@ if __name__ == "__main__":
         encode_video(mapper._video_dir, args.video_out, args.video_fps)
 
     print(mapper.summary())
+    if args.evaluate:
+        _log(mapper.evaluate(use_lpips=args.eval_lpips,
+                             json_path=args.eval_json))
     _log(report())
