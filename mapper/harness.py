@@ -551,6 +551,26 @@ class TriangleMapper:
               f"{m.n_splits_applied} edge splits ({m.n_splits_skipped} skipped)",
               f"                  {m.n_faces_rejected} faces refused "
               f"(degenerate, duplicate or non-manifold)"]
+        tm = self._model
+        if tm is not None:
+            def nbytes(*ts):
+                return sum(t.numel() * t.element_size() for t in ts
+                           if torch.is_tensor(t))
+            params = nbytes(tm.vertices, tm.vertex_weight,
+                            tm._features_dc, tm._features_rest)
+            buffers = nbytes(tm._triangle_indices, tm.image_size,
+                             tm.importance_score, getattr(tm, "face_patch", None))
+            adam = sum(nbytes(st.get("exp_avg"), st.get("exp_avg_sq"))
+                       for st in tm.optimizer.state.values()) \
+                if tm.optimizer is not None else 0
+            L.append(f"  model           {tm._triangle_indices.shape[0]} triangles, "
+                     f"{(params + buffers) / 2**20:.1f} MiB "
+                     f"({params / 2**20:.1f} params + {buffers / 2**20:.1f} buffers)"
+                     + (f", +{adam / 2**20:.1f} MiB Adam state" if adam else ""))
+        if torch.cuda.is_available():
+            L.append(f"  gpu             peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB "
+                     f"allocated, {torch.cuda.max_memory_reserved() / 2**20:.0f} MiB reserved")
+
         if rec_s > 0:
             L.append(f"  throughput      {rec_s:.1f} s of record in {wall:.1f} s wall "
                      f"= {rec_s/max(wall,1e-9):.2f}x real time, "
