@@ -96,8 +96,8 @@ class TriangleMapper:
                  opacity=INIT_OPACITY, iters_per_second=0.0,
                  record_fps=30.0, opt_window=8, weight_sparsity=False,
                  age_max_patches=AGE_MAX_PATCHES, eval_holdout=0,
-                 lambda_normal=0.0):
-        self.out_dir = "keyframe_debug/"
+                 lambda_normal=0.0, out_dir="keyframe_debug/"):
+        self.out_dir = out_dir
         self.device = device
         self.mesh = GlobalMesh(device=device)
         self.debug = debug                  # seam tile + age view; both debug-only
@@ -821,6 +821,10 @@ if __name__ == "__main__":
                    help="skip the seam debug tile and the age render")
     p.add_argument("--no_occlusion", action="store_true",
                    help="ignore rendered depth; treat all projected model area as covered")
+    p.add_argument("--out_dir", default="keyframe_debug/",
+                   help="where panels, patch npz files, video frames and the "
+                        "timing CSV go. Give each run of a sweep its own, or "
+                        "they overwrite each other")
     p.add_argument("--evaluate", action="store_true",
                    help="score the finished map on every keyframe and print a report")
     p.add_argument("--eval_holdout", type=int, default=0,
@@ -830,7 +834,8 @@ if __name__ == "__main__":
                         "it. 0 means evaluate on trained-on views only")
     p.add_argument("--eval_lpips", action="store_true",
                    help="also compute LPIPS (slow, downloads VGG weights)")
-    p.add_argument("--eval_json", default="keyframe_debug/eval.json")
+    p.add_argument("--eval_json", default=None,
+                   help="default: <out_dir>/eval.json")
     p.add_argument("--age_max_patches", type=int, default=AGE_MAX_PATCHES,
                    help="patches the age colour ramp spans before it "
                         "saturates. Set it near the number of keyframes you "
@@ -854,7 +859,8 @@ if __name__ == "__main__":
                    help="keep optimising after the keyframes run out, recording "
                         "if --video. This is also when sigma anneals, so it should\n"
                         "be at least --sigma_anneal_seconds")
-    p.add_argument("--video_out", default="keyframe_debug/map.mp4")
+    p.add_argument("--video_out", default=None,
+                   help="default: <out_dir>/map.mp4")
     p.add_argument("--sigma", type=float, default=FIXED_SIGMA,
                    help=f"initial softness for every triangle; default {FIXED_SIGMA} "
                         "(TS+ trains from 1.0)")
@@ -919,6 +925,12 @@ if __name__ == "__main__":
                    help="keyframes used to calibrate the mapping and scale")
     args = p.parse_args()
 
+    os.makedirs(args.out_dir, exist_ok=True)
+    if args.eval_json is None:
+        args.eval_json = os.path.join(args.out_dir, "eval.json")
+    if args.video_out is None:
+        args.video_out = os.path.join(args.out_dir, "map.mp4")
+
     gt = None
     if not args.no_gt_depth and args.records_dir:
         gt_dir = args.gt_depth_dir or depth_dir_for(args.records_dir)
@@ -955,7 +967,8 @@ if __name__ == "__main__":
                             weight_sparsity=args.weight_sparsity,
                             age_max_patches=args.age_max_patches,
                             eval_holdout=args.eval_holdout,
-                            lambda_normal=args.lambda_normal)
+                            lambda_normal=args.lambda_normal,
+                            out_dir=args.out_dir)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
