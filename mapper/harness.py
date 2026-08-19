@@ -97,9 +97,10 @@ class TriangleMapper:
                  record_fps=30.0, opt_window=8, weight_sparsity=False,
                  age_max_patches=AGE_MAX_PATCHES, eval_holdout=0,
                  lambda_normal=0.0, out_dir="keyframe_debug/",
-                 save_npz=True):
+                 save_npz=True, save_panels=True):
         self.out_dir = out_dir
         self.save_npz = save_npz
+        self.save_panels = save_panels
         self.device = device
         self.mesh = GlobalMesh(device=device)
         self.debug = debug                  # seam tile + age view; both debug-only
@@ -320,7 +321,8 @@ class TriangleMapper:
 
         opt_loss = self._advance(self._elapsed(record.index), record.index)
 
-        self.dump_views(kf, self.out_dir, image)
+        if self.save_panels:
+            self.dump_views(kf, self.out_dir, image)
         n_weld = int((ids >= 0).sum()) if ids is not None else 0
         # each welded seam edge closes one boundary edge on each side, so the
         # boundary grows by less than the patch's own outline
@@ -830,6 +832,10 @@ if __name__ == "__main__":
                    help="where panels, patch npz files, video frames and the "
                         "timing CSV go. Give each run of a sweep its own, or "
                         "they overwrite each other")
+    p.add_argument("--no_panels", action="store_true",
+                   help="skip the per-keyframe debug panel PNGs. With --fast "
+                        "this leaves only the metrics, which is what an "
+                        "evaluation run actually needs")
     p.add_argument("--no_patch_npz", action="store_true",
                    help="skip the per-keyframe .npz dumps. Nothing in-tree "
                         "reads them -- they exist for the polyscope viewer -- "
@@ -978,7 +984,8 @@ if __name__ == "__main__":
                             eval_holdout=args.eval_holdout,
                             lambda_normal=args.lambda_normal,
                             out_dir=args.out_dir,
-                            save_npz=not args.no_patch_npz)
+                            save_npz=not args.no_patch_npz,
+                            save_panels=not args.no_panels)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):

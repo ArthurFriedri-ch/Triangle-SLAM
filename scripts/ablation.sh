@@ -4,6 +4,7 @@
 #   ./scripts/ablation.sh              # six runs, no video
 #   ./scripts/ablation.sh --video      # ... and record each one (much slower)
 #   ./scripts/ablation.sh --npz        # ... and keep the per-keyframe .npz dumps
+#   ./scripts/ablation.sh --soft --lean  # soft only, metrics only, no images
 #   ./scripts/ablation.sh --max_kf 20  # short smoke test first
 #
 # Every run gets its own output directory, because panels, patch npz files,
@@ -21,12 +22,17 @@ OUT=${OUT:-runs/ablation_$STAMP}
 mkdir -p "$OUT"
 
 VIDEO=()
+CONDS=( soft hard )
+LEAN=()
 NPZ=( --no_patch_npz )   # ~1MB per keyframe per run; --npz to keep them
 EXTRA=()
 for a in "$@"; do
   case "$a" in
     --video) VIDEO=( --video --video_mode rgb --video_fov_scale 1.5 ) ;;
     --npz)   NPZ=() ;;
+    --soft)  CONDS=( soft ) ;;
+    --hard)  CONDS=( hard ) ;;
+    --lean)  LEAN=( --fast --no_panels ) ;;   # metrics only, no images
     *)       EXTRA+=( "$a" ) ;;
   esac
 done
@@ -58,7 +64,7 @@ cond_flags () {
 
 echo "sweep -> $OUT"
 for ds in "${SEQS[@]}"; do
-  for cond in soft hard; do
+  for cond in "${CONDS[@]}"; do
     tag="${ds}_${cond}"
     run_out="$OUT/$tag"
     log="$OUT/${tag}.log"
@@ -68,6 +74,7 @@ for ds in "${SEQS[@]}"; do
           --records_dir "data/${ds}_records"
           --out_dir "$run_out"
           "${COMMON[@]}" ${VIDEO[@]+"${VIDEO[@]}"} ${NPZ[@]+"${NPZ[@]}"}
+          ${LEAN[@]+"${LEAN[@]}"}
           $(seq_flags "$ds") $(cond_flags "$cond")
           ${EXTRA[@]+"${EXTRA[@]}"} )
 
