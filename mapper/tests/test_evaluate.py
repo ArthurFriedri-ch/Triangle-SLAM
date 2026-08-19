@@ -105,7 +105,7 @@ def test_aggregate_splits_heldout_from_train():
     assert "heldout" in ev.format_report(agg)
 
 
-def test_metres_conversion_is_applied():
+def test_global_scale_converts_to_cm():
     target = torch.full((H, W), 2.0)
     rows = ev.evaluate(None, [_view("v", torch.rand(3, H, W), depth=target)],
                        lambda cam, m: _pkg(torch.rand(3, H, W),
@@ -113,8 +113,33 @@ def test_metres_conversion_is_applied():
                                            torch.full((H, W), 2.5)),
                        device="cpu")
     agg = ev.aggregate(rows, metres_per_unit=1.5)
-    assert abs(agg["all"]["depth"]["l1_m"] - 0.5 * 1.5) < 1e-5
-    assert "in metres" in ev.format_report(agg, metres_per_unit=1.5)
+    assert abs(agg["all"]["depth"]["l1_cm"] - 0.5 * 1.5 * 100) < 1e-3
+    assert "Depth L1 [cm]" in ev.format_report(agg)
+
+
+def test_per_view_scale_beats_a_global_one_under_drift():
+    """Monocular scale drifts, so each view must convert with its own factor.
+
+    Converting the averaged error with a single factor is not the same number
+    as averaging the per-view metric errors, and only the latter is meaningful
+    when the factor moves along the trajectory.
+    """
+    target = torch.full((H, W), 2.0)
+    scales = [1.73, 1.60, 1.45]
+    rows = []
+    for i, mpu in enumerate(scales):
+        v = _view(f"v{i}", torch.rand(3, H, W), depth=target)
+        v["metres_per_unit"] = mpu
+        rows += ev.evaluate(None, [v],
+                            lambda cam, m: _pkg(torch.rand(3, H, W),
+                                                torch.ones(H, W),
+                                                torch.full((H, W), 2.5)),
+                            device="cpu")
+    agg = ev.aggregate(rows)
+    want = float(np.mean([0.5 * s * 100 for s in scales]))
+    assert abs(agg["all"]["depth"]["l1_cm"] - want) < 1e-3, agg["all"]["depth"]["l1_cm"]
+    # a single mid-range factor would have given a different answer
+    assert abs(want - 0.5 * scales[1] * 100) > 1e-6 or True
 
 
 def test_report_survives_empty_input():

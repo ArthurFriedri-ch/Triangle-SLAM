@@ -15,6 +15,7 @@ from arguments import PipelineParams, OptimizationParams
 from argparse import ArgumentParser
 from utils.timing import tic, count, frame_end, report, totals
 from utils.gt_depth import GtDepthSource, depth_dir_for
+from utils.point_utils import depth_to_normal
 from scene.global_mesh import GlobalMesh
 import evaluate as ev
 import torchvision
@@ -94,7 +95,8 @@ class TriangleMapper:
                  sigma=FIXED_SIGMA, sigma_final=SIGMA_FINAL, sigma_anneal_s=10.0,
                  opacity=INIT_OPACITY, iters_per_second=0.0,
                  record_fps=30.0, opt_window=8, weight_sparsity=False,
-                 age_max_patches=AGE_MAX_PATCHES, eval_holdout=0):
+                 age_max_patches=AGE_MAX_PATCHES, eval_holdout=0,
+                 lambda_normal=0.0):
         self.out_dir = "keyframe_debug/"
         self.device = device
         self.mesh = GlobalMesh(device=device)
@@ -113,6 +115,7 @@ class TriangleMapper:
         self.weight_sparsity = weight_sparsity
         self.age_max_patches = age_max_patches
         self.eval_holdout = eval_holdout   # keep every Nth keyframe out
+        self.lambda_normal = lambda_normal
         self._eval_views = []              # kept on CPU; see evaluate()
         self._views = []                    # cameras with real pixels
         self._overview = None               # fixed video camera
@@ -290,9 +293,20 @@ class TriangleMapper:
                    and len(self.mesh.patches) % self.eval_holdout == 0
                    and len(self.mesh.patches) > 1)
         cam = make_view(kf, kf.rgb.shape[1], kf.rgb.shape[0], image=rgb_chw)
+        if self.lambda_normal > 0:
+            # TS+ takes normals from the dataset; keyframes have none, but they
+            # do have depth, and the renderer's own depth_to_normal turns one
+            # into the other. This is a smoothness prior rather than independent
+            # supervision -- the normals come from the same depth the geometry
+            # was seeded from -- but it does tie the rendered surface normal to
+            # the observed surface rather than leaving it unconstrained.
+            with torch.no_grad():
+                cam.normal_map = depth_to_normal(
+                    cam, kf.depth[None]).permute(2, 0, 1).contiguous()
         self._eval_views.append({
             "name": f"kf{record.index:04d}", "camera": cam,
             "rgb": rgb_chw.detach().cpu(), "depth": kf.depth.detach().cpu(),
+            "metres_per_unit": getattr(self.gt_depth, "last_frame_scale", None),
             "heldout": heldout})
         if not heldout:
             self._views.append(cam)
@@ -356,6 +370,9 @@ class TriangleMapper:
                 pixel = l1_loss(image, gt)
                 loss = ((1.0 - _opt.lambda_dssim) * pixel
                         + _opt.lambda_dssim * (1.0 - ssim(image, gt)))
+                if self.lambda_normal > 0 and getattr(cam, "normal_map", None) is not None:
+                    n_err = (1.0 - (pkg["rend_normal"] * cam.normal_map).sum(0))
+                    loss = loss + self.lambda_normal * n_err.mean()
                 if self.weight_sparsity:
                     loss = loss + (tm.get_vertex_weight[tm._triangle_indices].mean()
                                    * _opt.lambda_weight)
@@ -859,6 +876,11 @@ if __name__ == "__main__":
                         "seconds when the dataset carries no timestamps")
     p.add_argument("--opt_window", type=int, default=8,
                    help="how many recent keyframes optimisation trains against")
+    p.add_argument("--lambda_normal", type=float, default=0.0,
+                   help="weight on a normal-consistency term. The target normals "
+                        "are derived from the keyframe's own depth, since "
+                        "keyframes carry no normal map; TS+ uses 0.001 with "
+                        "dataset normals")
     p.add_argument("--weight_sparsity", action="store_true",
                    help="add the TS+ vertex-weight sparsity term to the loss")
     p.add_argument("--min_region_frac", type=float, default=MIN_REGION_FRAC,
@@ -932,7 +954,8 @@ if __name__ == "__main__":
                             opt_window=args.opt_window,
                             weight_sparsity=args.weight_sparsity,
                             age_max_patches=args.age_max_patches,
-                            eval_holdout=args.eval_holdout)
+                            eval_holdout=args.eval_holdout,
+                            lambda_normal=args.lambda_normal)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):

@@ -29,7 +29,7 @@ from utils.image_utils import psnr
 from utils.loss_utils import ssim
 
 
-def _depth_stats(rendered, target, covered, taus):
+def _depth_stats(rendered, target, covered, taus, mpu=None):
     """Depth agreement over the pixels the map actually covers."""
     valid = covered & (target > 0) & (rendered > 0) & torch.isfinite(rendered)
     n = int(valid.sum())
@@ -46,6 +46,13 @@ def _depth_stats(rendered, target, covered, taus):
     }
     for t in taus:                      # fraction within a relative threshold
         out[f"delta_{t:g}"] = float((rel < t).float().mean())
+    if mpu:
+        # centimetres, the unit MonoGS and Point-SLAM report Depth L1 in. The
+        # conversion is per view because monocular scale drifts along the
+        # trajectory, so one global factor would be wrong at both ends.
+        out["l1_cm"] = out["l1"] * mpu * 100.0
+        out["rmse_cm"] = out["rmse"] * mpu * 100.0
+        out["median_cm"] = out["median"] * mpu * 100.0
     return out
 
 
@@ -60,8 +67,11 @@ def evaluate(model, views, render_fn, alpha_thresh=0.5,
     """
     lpips_fn = None
     if use_lpips:
-        from lpipsPyTorch import lpips as _lpips
-        lpips_fn = _lpips
+        # lpipsPyTorch.lpips() constructs and loads a VGG on every call, which
+        # over a whole sequence dominates the evaluation. Build it once.
+        from lpipsPyTorch.modules.lpips import LPIPS
+        _net = LPIPS("vgg", "0.1").to(device).eval()
+        lpips_fn = lambda a, b: _net(a[None], b[None])
 
     rows = []
     for v in views:
@@ -80,10 +90,11 @@ def evaluate(model, views, render_fn, alpha_thresh=0.5,
                 "coverage": float(covered.float().mean()),
             }
             if lpips_fn is not None:
-                row["lpips"] = float(lpips_fn(img, gt, net_type="vgg"))
+                row["lpips"] = float(lpips_fn(img, gt))
             if v.get("depth") is not None:
                 d = _depth_stats(pkg["surf_depth"].squeeze(0),
-                                 v["depth"].to(device), covered, taus)
+                                 v["depth"].to(device), covered, taus,
+                                 mpu=v.get("metres_per_unit"))
                 if d:
                     row["depth"] = d
         rows.append(row)
@@ -115,9 +126,9 @@ def aggregate(rows, metres_per_unit=None):
             g["depth"] = {k: mean([d[k] for d in dep])
                           for k in dep[0] if k != "n_px"}
             g["depth"]["n_px"] = int(np.sum([d["n_px"] for d in dep]))
-            if metres_per_unit:
-                for k in ("l1", "rmse", "median"):
-                    g["depth"][k + "_m"] = g["depth"][k] * metres_per_unit
+            if metres_per_unit and "l1_cm" not in g["depth"]:
+                for k in ("l1", "rmse", "median"):      # single global factor
+                    g["depth"][k + "_cm"] = g["depth"][k] * metres_per_unit * 100.0
         out[label] = g
     return out
 
@@ -155,11 +166,17 @@ def format_report(agg, metres_per_unit=None):
                    f"{d['median']:10.4f}{d['rel']:8.3f}")
             row += "".join(f"{100*d[t]:7.1f}%" for t in taus)
             L.append(row)
-        if metres_per_unit:
-            a = agg.get("all", {}).get("depth", {})
-            if "l1_m" in a:
-                L.append(f"  in metres ({metres_per_unit:.3f} m/unit): "
-                         f"L1 {a['l1_m']:.4f} m, RMSE {a['rmse_m']:.4f} m")
+        if any("l1_cm" in agg[k].get("depth", {}) for k in agg):
+            L += ["", "  Depth L1 [cm] -- the unit MonoGS and Point-SLAM report"]
+            for label in ("heldout", "train", "all"):
+                d = agg.get(label, {}).get("depth", {})
+                if "l1_cm" in d:
+                    L.append(f"  {label:<10}{d['l1_cm']:10.2f}{d['rmse_cm']:10.2f}"
+                             f"{d['median_cm']:10.2f}   (L1 / RMSE / median)")
+            L.append("  NOTE: measured over covered pixels against the keyframe's own "
+                     "depth.\n        Those works evaluate against a ground-truth mesh "
+                     "over the full\n        frame, so treat this as indicative, not "
+                     "a like-for-like number.")
         L.append(f"  measured over {dep['n_px']:,} pixels")
     L.append("=" * 68)
     return "\n".join(L)

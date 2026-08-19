@@ -68,6 +68,7 @@ class GtDepthSource:
             raise ValueError(f"align must be per_frame/global/none, got {align!r}")
         self.align = align
         self.scale_spread = None
+        self.last_frame_scale = None
         self.undistort = undistort
         self.max_depth = max_depth
 
@@ -216,6 +217,9 @@ class GtDepthSource:
             local = self._frame_scale(d, record.depth)
             if local is not None:
                 s = local
+        # metres per record unit for THIS keyframe, so downstream evaluation can
+        # report in metric units even under per-frame alignment
+        self.last_frame_scale = s
         return (d / s).astype(np.float32)                    # into pose scale
 
     def _frame_scale(self, metric, slam_depth, min_px=500):
