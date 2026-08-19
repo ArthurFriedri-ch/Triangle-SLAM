@@ -96,8 +96,10 @@ class TriangleMapper:
                  opacity=INIT_OPACITY, iters_per_second=0.0,
                  record_fps=30.0, opt_window=8, weight_sparsity=False,
                  age_max_patches=AGE_MAX_PATCHES, eval_holdout=0,
-                 lambda_normal=0.0, out_dir="keyframe_debug/"):
+                 lambda_normal=0.0, out_dir="keyframe_debug/",
+                 save_npz=True):
         self.out_dir = out_dir
+        self.save_npz = save_npz
         self.device = device
         self.mesh = GlobalMesh(device=device)
         self.debug = debug                  # seam tile + age view; both debug-only
@@ -267,7 +269,10 @@ class TriangleMapper:
             self._advance(self._elapsed(record.index), record.index)
             return
 
-        save_patch_npz(patch, os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"), ids)
+        if self.save_npz:
+            save_patch_npz(patch,
+                           os.path.join(self.out_dir, f"kf{kf.index:04d}.npz"),
+                           ids)
 
         patch.age = record.index
         b_before = self.mesh.boundary_edge_count()
@@ -825,6 +830,10 @@ if __name__ == "__main__":
                    help="where panels, patch npz files, video frames and the "
                         "timing CSV go. Give each run of a sweep its own, or "
                         "they overwrite each other")
+    p.add_argument("--no_patch_npz", action="store_true",
+                   help="skip the per-keyframe .npz dumps. Nothing in-tree "
+                        "reads them -- they exist for the polyscope viewer -- "
+                        "and they dominate the output size of a long run")
     p.add_argument("--evaluate", action="store_true",
                    help="score the finished map on every keyframe and print a report")
     p.add_argument("--eval_holdout", type=int, default=0,
@@ -968,7 +977,8 @@ if __name__ == "__main__":
                             age_max_patches=args.age_max_patches,
                             eval_holdout=args.eval_holdout,
                             lambda_normal=args.lambda_normal,
-                            out_dir=args.out_dir)
+                            out_dir=args.out_dir,
+                            save_npz=not args.no_patch_npz)
     source = source_from_socket(args.port) if args.port else source_from_dir(args.records_dir)
 
     for i, record in enumerate(source):
