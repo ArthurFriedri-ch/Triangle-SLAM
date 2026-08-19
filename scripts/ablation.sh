@@ -51,8 +51,8 @@ seq_flags () {
 # "hard" is near-opaque triangles with no anneal.
 cond_flags () {
   case "$1" in
-    soft) echo "--sigma 1.0 --sigma_final 0.0001 --sigma_anneal_seconds 10" ;;
-    hard) echo "--sigma 0.001 --sigma_anneal_seconds 0" ;;
+    soft) echo "--eval_lpips --sigma 1.0 --sigma_final 0.0001 --sigma_anneal_seconds 10" ;;
+    hard) echo "--eval_lpips --sigma 0.001 --sigma_anneal_seconds 0" ;;
   esac
 }
 

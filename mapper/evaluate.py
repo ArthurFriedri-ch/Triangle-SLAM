@@ -89,6 +89,22 @@ def evaluate(model, views, render_fn, alpha_thresh=0.5,
                 "ssim": float(ssim(img, gt)),
                 "coverage": float(covered.float().mean()),
             }
+            # Full-frame PSNR is dominated by how much of the frame is covered:
+            # an uncovered pixel renders the background against a real image, so
+            # 77% coverage caps PSNR near 13 dB however good the surface is. The
+            # masked figures score only the pixels the map claims, which is what
+            # separates "how much did it map" from "how well".
+            m = covered.expand_as(img)
+            if int(covered.sum()) > 0:
+                mse = float(((img - gt)[m] ** 2).mean())
+                row["psnr_masked"] = float("inf") if mse <= 0 else \
+                    float(10.0 * np.log10(1.0 / mse))
+                # composite the render over the ground truth outside the mask, so
+                # SSIM and LPIPS see no synthetic edge at the coverage boundary
+                blend = torch.where(m, img, gt)
+                row["ssim_masked"] = float(ssim(blend, gt))
+                if lpips_fn is not None:
+                    row["lpips_masked"] = float(lpips_fn(blend, gt))
             if lpips_fn is not None:
                 row["lpips"] = float(lpips_fn(img, gt))
             if v.get("depth") is not None:
@@ -118,9 +134,10 @@ def aggregate(rows, metres_per_unit=None):
             "ssim": mean([r["ssim"] for r in sel]),
             "coverage": mean([r["coverage"] for r in sel]),
         }
-        lp = [r["lpips"] for r in sel if "lpips" in r]
-        if lp:
-            g["lpips"] = mean(lp)
+        for k in ("psnr_masked", "ssim_masked", "lpips", "lpips_masked"):
+            vals = [r[k] for r in sel if k in r and np.isfinite(r[k])]
+            if vals:
+                g[k] = mean(vals)
         dep = [r["depth"] for r in sel if "depth" in r]
         if dep:
             g["depth"] = {k: mean([d[k] for d in dep])

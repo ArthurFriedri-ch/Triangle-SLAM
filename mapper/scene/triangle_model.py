@@ -410,7 +410,7 @@ class TriangleModel:
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "vertices":
-                    if iteration < 1000:
+                    if iteration < 100:
                         lr = 0
                     else:
                         lr = self.triangle_scheduler_args(iteration)
