@@ -142,6 +142,58 @@ def test_per_view_scale_beats_a_global_one_under_drift():
     assert abs(want - 0.5 * scales[1] * 100) > 1e-6 or True
 
 
+def test_masked_psnr_is_independent_of_coverage():
+    """The whole point: masked score must not move when only coverage does.
+
+    Unmasked PSNR is bounded by coverage alone -- an uncovered pixel renders the
+    background against a real image -- so comparing two runs on it mostly
+    compares how much of the frame each one mapped.
+    """
+    # keep gt below 0.9 so gt+0.1 never clamps: the error is then exactly 0.1
+    # everywhere, and any difference between the two runs is coverage, not noise
+    gt = torch.rand(3, H, W) * 0.9
+    err = gt + 0.1
+
+    def run(frac):
+        alpha = torch.zeros(H, W)
+        alpha[: int(H * frac)] = 1.0
+        # the real rasteriser composites over the background, so an uncovered
+        # pixel comes out black; the stub has to do the same or the unmasked
+        # metric has nothing to be penalised by
+        img = err * alpha
+        return ev.evaluate(None, [_view("v", gt)],
+                           lambda cam, m: _pkg(img, alpha, torch.ones(H, W)),
+                           device="cpu")[0]
+
+    lo, hi = run(0.25), run(1.0)
+    assert abs(lo["coverage"] - 0.25) < 1e-6 and abs(hi["coverage"] - 1.0) < 1e-6
+    # masked: same error, same score
+    assert abs(lo["psnr_masked"] - hi["psnr_masked"]) < 1e-4, \
+        (lo["psnr_masked"], hi["psnr_masked"])
+    # unmasked: the sparse one looks far worse purely because of the black
+    assert lo["psnr"] < hi["psnr"] - 3.0
+
+
+def test_masked_psnr_still_tracks_real_error():
+    gt = torch.rand(3, H, W)
+    alpha = torch.ones(H, W)
+    good = ev.evaluate(None, [_view("v", gt)],
+                       lambda cam, m: _pkg((gt + 0.02).clamp(0, 1), alpha,
+                                           torch.ones(H, W)), device="cpu")[0]
+    bad = ev.evaluate(None, [_view("v", gt)],
+                      lambda cam, m: _pkg((gt + 0.25).clamp(0, 1), alpha,
+                                          torch.ones(H, W)), device="cpu")[0]
+    assert good["psnr_masked"] > bad["psnr_masked"] + 5
+
+
+def test_masked_metrics_absent_when_nothing_covered():
+    rows = ev.evaluate(None, [_view("v", torch.rand(3, H, W))],
+                       lambda cam, m: _pkg(torch.rand(3, H, W),
+                                           torch.zeros(H, W), torch.ones(H, W)),
+                       device="cpu")
+    assert "psnr_masked" not in rows[0] and rows[0]["coverage"] == 0.0
+
+
 def test_report_survives_empty_input():
     assert "no views" in ev.format_report({})
 

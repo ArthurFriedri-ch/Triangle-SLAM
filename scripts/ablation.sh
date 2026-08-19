@@ -34,7 +34,7 @@ done
 # Everything held fixed across the sweep. Only sigma varies.
 COMMON=( --occlusion_tol 0.50 --occlusion_min_area 100 --min_region_frac 0.01
          --opacity 0.28 --iters_per_second 1000 --age_max_patches 100
-         --tail_seconds 10 --evaluate --eval_holdout 6 )
+         --tail_seconds 10 --evaluate --eval_holdout 6 --eval_lpips )
 
 # office0's ground-truth depth calibration refuses (its record indices do not
 # match the dataset frame numbers), and freiburg1_desk has no _depth folder at
@@ -51,8 +51,8 @@ seq_flags () {
 # "hard" is near-opaque triangles with no anneal.
 cond_flags () {
   case "$1" in
-    soft) echo "--eval_lpips --sigma 1.0 --sigma_final 0.0001 --sigma_anneal_seconds 10" ;;
-    hard) echo "--eval_lpips --sigma 0.001 --sigma_anneal_seconds 0" ;;
+    soft) echo "--sigma 1.0 --sigma_final 0.0001 --sigma_anneal_seconds 10" ;;
+    hard) echo "--sigma 0.001 --sigma_anneal_seconds 0" ;;
   esac
 }
 

@@ -155,15 +155,22 @@ def format_report(agg, metres_per_unit=None):
     if not agg:
         return "\n".join(L + ["  no views to evaluate", "=" * 68])
 
-    hdr = f"  {'':<10}{'views':>6}{'PSNR':>9}{'SSIM':>8}{'LPIPS':>8}{'coverage':>10}"
-    L.append(hdr)
+    L.append(f"  {'':<10}{'views':>6}{'coverage':>10}"
+             f"{'PSNR':>9}{'SSIM':>8}{'LPIPS':>8}   |"
+             f"{'PSNR*':>9}{'SSIM*':>8}{'LPIPS*':>8}")
     for label in ("heldout", "train", "all"):
         g = agg.get(label)
         if not g:
             continue
-        lp = f"{g['lpips']:8.4f}" if "lpips" in g else f"{'-':>8}"
-        L.append(f"  {label:<10}{g['n_views']:6d}{g['psnr']:9.2f}{g['ssim']:8.4f}"
-                 f"{lp}{100*g['coverage']:9.1f}%")
+        f4 = lambda k: f"{g[k]:8.4f}" if k in g and g[k] is not None else f"{'-':>8}"
+        f2 = lambda k: f"{g[k]:9.2f}" if k in g and g[k] is not None else f"{'-':>9}"
+        L.append(f"  {label:<10}{g['n_views']:6d}{100*g['coverage']:9.1f}%"
+                 f"{g['psnr']:9.2f}{g['ssim']:8.4f}{f4('lpips')}   |"
+                 f"{f2('psnr_masked')}{f4('ssim_masked')}{f4('lpips_masked')}")
+    L += ["  * = scored over covered pixels only. Unmasked PSNR is bounded by",
+          "    coverage alone -- at 77% it cannot exceed ~13 dB however good the",
+          "    reconstructed surface is -- so the starred columns are the ones that",
+          "    compare reconstruction quality rather than how much was mapped."]
 
     dep = next((agg[k]["depth"] for k in ("heldout", "train", "all")
                 if k in agg and "depth" in agg[k]), None)

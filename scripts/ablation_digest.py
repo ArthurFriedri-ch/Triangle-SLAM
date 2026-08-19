@@ -43,8 +43,8 @@ def main(root):
     print("=" * 100)
     print(f"  ablation summary -- {root}")
     print("=" * 100)
-    hdr = (f"  {'run':<22}{'set':<9}{'PSNR':>7}{'SSIM':>8}{'LPIPS':>8}"
-           f"{'cover':>7}{'DepthL1cm':>11}{'tris':>8}{'iters':>8}{'wall':>8}")
+    hdr = (f"  {'run':<22}{'set':<9}{'cover':>7}{'PSNR*':>8}{'SSIM*':>8}"
+           f"{'LPIPS*':>8}{'PSNR':>8}{'Depth L1':>12}{'tris':>8}{'wall':>8}")
     print(hdr)
     print("-" * 100)
     for r in runs:
@@ -58,17 +58,27 @@ def main(root):
             if not g:
                 continue
             d = g.get("depth", {})
-            lp = f"{g['lpips']:8.4f}" if g.get("lpips") is not None else f"{'-':>8}"
-            cm = f"{d['l1_cm']:11.2f}" if "l1_cm" in d else f"{d.get('l1', 0):11.4f}"
+            # Depth L1 is only in cm when a metric scale existed for that run;
+            # otherwise it is in the tracker's own units. Printing both under one
+            # header made office0 look 300x better than freiburg when it was not.
+            if "l1_cm" in d:
+                dep = f"{d['l1_cm']:9.2f} cm"
+            elif "l1" in d:
+                dep = f"{d['l1']:10.4f} u"
+            else:
+                dep = f"{'-':>12}"
+            f4 = lambda k: (f"{g[k]:8.4f}" if g.get(k) is not None else f"{'-':>8}")
+            f2 = lambda k: (f"{g[k]:8.2f}" if g.get(k) is not None else f"{'-':>8}")
             first = label == "heldout"
-            print(f"  {r if first else '':<22}{label:<9}{g['psnr']:7.2f}"
-                  f"{g['ssim']:8.4f}{lp}{100*g['coverage']:6.1f}%{cm}"
+            print(f"  {r if first else '':<22}{label:<9}{100*g['coverage']:6.1f}%"
+                  f"{f2('psnr_masked')}{f4('ssim_masked')}{f4('lpips_masked')}"
+                  f"{g['psnr']:8.2f}{dep}"
                   f"{extra.get('tris', '-') if first else '':>8}"
-                  f"{extra.get('iters', '-') if first else '':>8}"
                   f"{(extra.get('wall', '-') + 's') if first else '':>8}")
     print("=" * 100)
-    print("  Depth L1 is in cm only where a metric scale was available; otherwise")
-    print("  it is in record units. See the per-run logs for the caveat in full.")
+    print("  * scored over covered pixels only; plain PSNR is bounded by coverage.")
+    print("  Depth L1: 'cm' where a metric scale existed, 'u' = tracker units")
+    print("  (no ground-truth depth for that run) -- the two are NOT comparable.")
     print()
 
 
