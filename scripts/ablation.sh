@@ -14,6 +14,8 @@ set -uo pipefail          # deliberately not -e: one failed run must not kill th
 
 cd "$(dirname "$0")/.."
 PY=${PY:-python}
+# BSD date has no -Is; fall back so the script runs on macOS too
+now () { date -Is 2>/dev/null || date "+%Y-%m-%dT%H:%M:%S%z"; }
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT=${OUT:-runs/ablation_$STAMP}
 mkdir -p "$OUT"
@@ -71,7 +73,7 @@ for ds in "${SEQS[@]}"; do
 
     {
       echo "### $tag"
-      echo "### started $(date -Is)"
+      echo "### started $(now)"
       echo "### ${cmd[*]}"
       echo
     } > "$log"
@@ -80,9 +82,12 @@ for ds in "${SEQS[@]}"; do
     echo "=============================================================="
     echo "  $tag"
     echo "=============================================================="
-    "${cmd[@]}" 2>&1 | tee -a "$log"
+    # </dev/null matters when detached: a background child that reads from a
+    # terminal which has gone away is stopped with SIGTTIN, which looks exactly
+    # like the run having silently died.
+    "${cmd[@]}" </dev/null 2>&1 | tee -a "$log"
     rc=${PIPESTATUS[0]}
-    echo "### exit $rc at $(date -Is)" >> "$log"
+    echo "### exit $rc at $(now)" >> "$log"
     [ "$rc" -ne 0 ] && echo "  !! $tag exited $rc (continuing)"
   done
 done
